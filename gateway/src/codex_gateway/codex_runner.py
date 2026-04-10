@@ -85,6 +85,15 @@ class CodexTurnResult:
     final_text: str
 
 
+@dataclass(frozen=True)
+class CodexThreadInfo:
+    thread_id: str
+    name: str | None
+    preview: str
+    cwd: str
+    model: str | None = None
+
+
 class CodexRunner:
     def __init__(
         self,
@@ -195,5 +204,135 @@ class CodexRunner:
                 thread_id=active_thread_id,
                 final_text=final_text or "[no assistant text]",
             )
+        finally:
+            client.close()
+
+    def new_thread(self) -> CodexThreadInfo:
+        client = AppServerClient(
+            config=self._app_server_config,
+            approval_handler=_deny_approval,
+        )
+        try:
+            client.start()
+            client.initialize()
+            started = client.thread_start(
+                {
+                    "model": self._model,
+                    "cwd": self._app_server_config.cwd,
+                    "approvalPolicy": self._approval_policy.root.value,
+                    "sandbox": self._sandbox_mode.value,
+                }
+            )
+            return CodexThreadInfo(
+                thread_id=started.thread.id,
+                name=started.thread.name,
+                preview=started.thread.preview,
+                cwd=started.thread.cwd,
+                model=started.model,
+            )
+        finally:
+            client.close()
+
+    def compact_thread(self, *, thread_id: str) -> None:
+        client = AppServerClient(
+            config=self._app_server_config,
+            approval_handler=_deny_approval,
+        )
+        try:
+            client.start()
+            client.initialize()
+            client.thread_compact(thread_id)
+        finally:
+            client.close()
+
+    def fork_thread(self, *, thread_id: str) -> CodexThreadInfo:
+        client = AppServerClient(
+            config=self._app_server_config,
+            approval_handler=_deny_approval,
+        )
+        try:
+            client.start()
+            client.initialize()
+            forked = client.thread_fork(
+                thread_id,
+                {
+                    "threadId": thread_id,
+                    "model": self._model,
+                    "cwd": self._app_server_config.cwd,
+                    "approvalPolicy": self._approval_policy.root.value,
+                    "sandbox": self._sandbox_mode.value,
+                },
+            )
+            return CodexThreadInfo(
+                thread_id=forked.thread.id,
+                name=forked.thread.name,
+                preview=forked.thread.preview,
+                cwd=forked.thread.cwd,
+                model=forked.model,
+            )
+        finally:
+            client.close()
+
+    def rename_thread(self, *, thread_id: str, name: str) -> None:
+        client = AppServerClient(
+            config=self._app_server_config,
+            approval_handler=_deny_approval,
+        )
+        try:
+            client.start()
+            client.initialize()
+            client.thread_set_name(thread_id, name)
+        finally:
+            client.close()
+
+    def read_thread(self, *, thread_id: str) -> CodexThreadInfo:
+        client = AppServerClient(
+            config=self._app_server_config,
+            approval_handler=_deny_approval,
+        )
+        try:
+            client.start()
+            client.initialize()
+            thread = client.thread_read(thread_id, include_turns=False).thread
+            return CodexThreadInfo(
+                thread_id=thread.id,
+                name=thread.name,
+                preview=thread.preview,
+                cwd=thread.cwd,
+            )
+        finally:
+            client.close()
+
+    def list_threads(self, *, limit: int = 10) -> list[CodexThreadInfo]:
+        client = AppServerClient(
+            config=self._app_server_config,
+            approval_handler=_deny_approval,
+        )
+        try:
+            client.start()
+            client.initialize()
+            response = client.thread_list({"limit": limit, "cwd": self._app_server_config.cwd})
+            return [
+                CodexThreadInfo(
+                    thread_id=thread.id,
+                    name=thread.name,
+                    preview=thread.preview,
+                    cwd=thread.cwd,
+                )
+                for thread in response.data
+            ]
+        finally:
+            client.close()
+
+    def list_models(self) -> list[str]:
+        client = AppServerClient(
+            config=self._app_server_config,
+            approval_handler=_deny_approval,
+        )
+        try:
+            client.start()
+            client.initialize()
+            models = client.model_list(include_hidden=False).data
+            return [model.id for model in models]
         finally:
             client.close()

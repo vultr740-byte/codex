@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .messages import InboundMessage, normalize_user_text
+from .slash_commands import parse_telegram_command
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class TelegramApiError(RuntimeError):
 class TelegramApi:
     def __init__(self, token: str) -> None:
         self._base = f"https://api.telegram.org/bot{token}"
+        self._bot_username: str | None = None
 
     def get_updates(self, *, offset: int | None, timeout: int = 20) -> list[TelegramUpdate]:
         query = {"timeout": str(timeout)}
@@ -38,6 +40,20 @@ class TelegramApi:
             if parsed is not None:
                 updates.append(parsed)
         return updates
+
+    def get_me(self) -> dict[str, Any]:
+        payload = self._request_json("getMe")
+        if isinstance(payload, dict):
+            username = payload.get("username")
+            if isinstance(username, str) and username:
+                self._bot_username = username
+        return payload
+
+    def set_my_commands(self, commands: list[dict[str, str]]) -> None:
+        self._request_json(
+            "setMyCommands",
+            data={"commands": commands},
+        )
 
     def send_message(self, *, chat_id: int, text: str) -> int:
         payload = self._request_json(
@@ -114,6 +130,7 @@ class TelegramApi:
         message_id = message.get("message_id")
         if not isinstance(chat_id, int) or not isinstance(message_id, int):
             return None
+        parsed_command = parse_telegram_command(text, bot_username=self._bot_username)
         inbound = InboundMessage(
             channel="telegram",
             chat_id=chat_id,
@@ -121,5 +138,7 @@ class TelegramApi:
             user_id=from_user.get("id") if isinstance(from_user.get("id"), int) else None,
             text=normalize_user_text(text),
             is_group=chat.get("type") in {"group", "supergroup"},
+            command=parsed_command.key if parsed_command is not None else None,
+            command_args=parsed_command.args if parsed_command is not None else "",
         )
         return TelegramUpdate(update_id=int(item["update_id"]), message=inbound)

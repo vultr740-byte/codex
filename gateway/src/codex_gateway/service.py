@@ -4,12 +4,14 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+import textwrap
 
 from .codex_runner import ApprovalNotAllowedError, CodexRunner
 from .config import GatewayConfig
 from .db import GatewayDb
 from .messages import InboundMessage
 from .responses_bridge import ResponsesBridge
+from .slash_commands import registered_telegram_commands
 from .telegram_api import TelegramApi, TelegramApiError
 
 logger = logging.getLogger(__name__)
@@ -196,6 +198,7 @@ class GatewayService:
         update_offset: int | None = None
         self._bridge.start()
         logger.info("responses bridge started base_url=%s upstream=%s", self._bridge.local_base_url, self._config.openai_base_url)
+        self._register_telegram_commands()
         logger.info("telegram polling started")
         while True:
             try:
@@ -231,6 +234,9 @@ class GatewayService:
 
     def _process_message(self, lock: threading.Lock, message: InboundMessage) -> None:
         with lock:
+            if message.command:
+                self._process_command_message(message)
+                return
             started_at = time.monotonic()
             first_delta_at: float | None = None
             delta_count = 0
@@ -329,6 +335,153 @@ class GatewayService:
     def _send_final_message(self, *, chat_id: int, text: str) -> None:
         final_text = text.strip() or "[no assistant text]"
         self._telegram.send_message(chat_id=chat_id, text=final_text)
+
+    def _register_telegram_commands(self) -> None:
+        try:
+            self._telegram.get_me()
+            self._telegram.set_my_commands(registered_telegram_commands())
+        except TelegramApiError:
+            logger.exception("failed to register telegram commands")
+
+    def _process_command_message(self, message: InboundMessage) -> None:
+        command = message.command or ""
+        args = message.command_args.strip()
+        try:
+            if command == "new":
+                thread = self._codex_runner.new_thread()
+                self._db.save_session(
+                    channel="telegram",
+                    external_chat_id=str(message.chat_id),
+                    codex_thread_id=thread.thread_id,
+                )
+                self._telegram.send_message(
+                    chat_id=message.chat_id,
+                    text=f"Started a new thread.\nthread_id: {thread.thread_id}",
+                )
+                return
+
+            session = self._db.get_session(channel="telegram", external_chat_id=str(message.chat_id))
+            if command in {"compact", "fork", "rename", "status"} and session is None:
+                self._telegram.send_message(
+                    chat_id=message.chat_id,
+                    text="No active thread for this chat yet. Send /new or a normal message first.",
+                )
+                return
+
+            if command == "compact":
+                self._codex_runner.compact_thread(thread_id=session.codex_thread_id)  # type: ignore[union-attr]
+                self._telegram.send_message(chat_id=message.chat_id, text="Started compaction for the current thread.")
+                return
+
+            if command == "fork":
+                forked = self._codex_runner.fork_thread(thread_id=session.codex_thread_id)  # type: ignore[union-attr]
+                self._db.save_session(
+                    channel="telegram",
+                    external_chat_id=str(message.chat_id),
+                    codex_thread_id=forked.thread_id,
+                )
+                self._telegram.send_message(
+                    chat_id=message.chat_id,
+                    text=f"Forked the current thread.\nthread_id: {forked.thread_id}",
+                )
+                return
+
+            if command == "rename":
+                if not args:
+                    self._telegram.send_message(chat_id=message.chat_id, text="Usage: /rename <new thread name>")
+                    return
+                self._codex_runner.rename_thread(thread_id=session.codex_thread_id, name=args)  # type: ignore[union-attr]
+                self._telegram.send_message(chat_id=message.chat_id, text=f"Renamed the current thread to: {args}")
+                return
+
+            if command == "resume":
+                threads = self._codex_runner.list_threads(limit=20)
+                if not args:
+                    if not threads:
+                        self._telegram.send_message(chat_id=message.chat_id, text="No saved threads found for the current working directory.")
+                        return
+                    lines = ["Usage: /resume <thread_id or preview substring>", "", "Recent threads:"]
+                    for thread in threads[:10]:
+                        title = thread.name or thread.preview or "(untitled)"
+                        lines.append(f"- {thread.thread_id}  {title[:80]}")
+                    self._telegram.send_message(chat_id=message.chat_id, text="\n".join(lines))
+                    return
+
+                target = next((thread for thread in threads if thread.thread_id == args), None)
+                if target is None:
+                    lowered = args.lower()
+                    target = next(
+                        (
+                            thread
+                            for thread in threads
+                            if lowered in (thread.name or "").lower() or lowered in thread.preview.lower()
+                        ),
+                        None,
+                    )
+                if target is None:
+                    self._telegram.send_message(chat_id=message.chat_id, text=f"No matching thread found for: {args}")
+                    return
+                self._db.save_session(
+                    channel="telegram",
+                    external_chat_id=str(message.chat_id),
+                    codex_thread_id=target.thread_id,
+                )
+                self._telegram.send_message(
+                    chat_id=message.chat_id,
+                    text=f"Resumed thread.\nthread_id: {target.thread_id}",
+                )
+                return
+
+            if command == "status":
+                info = self._codex_runner.read_thread(thread_id=session.codex_thread_id)  # type: ignore[union-attr]
+                lines = [
+                    f"thread_id: {info.thread_id}",
+                    f"name: {info.name or '(untitled)'}",
+                    f"preview: {info.preview or '(empty)'}",
+                    f"cwd: {info.cwd}",
+                    f"model: {self._config.codex_model}",
+                    f"approval_policy: {self._config.codex_approval_policy}",
+                    f"sandbox_mode: {self._config.codex_sandbox_mode}",
+                ]
+                self._telegram.send_message(chat_id=message.chat_id, text="\n".join(lines))
+                return
+
+            if command == "model":
+                models = self._codex_runner.list_models()
+                self._telegram.send_message(
+                    chat_id=message.chat_id,
+                    text="Available models:\n" + "\n".join(f"- {model}" for model in models[:40]),
+                )
+                return
+
+            unsupported = self._unsupported_command_message(command)
+            self._telegram.send_message(chat_id=message.chat_id, text=unsupported)
+        except ApprovalNotAllowedError:
+            logger.exception("unexpected approval request while processing command")
+            self._telegram.send_message(
+                chat_id=message.chat_id,
+                text="This deployment is configured for non-interactive execution only. The command requested approval and was stopped.",
+            )
+        except Exception:
+            logger.exception("failed to process telegram command")
+            self._telegram.send_message(
+                chat_id=message.chat_id,
+                text="Codex failed to process this command.",
+            )
+
+    def _unsupported_command_message(self, command: str) -> str:
+        if command == "clear":
+            return "Telegram does not have a terminal UI to clear. Use /new to start a fresh thread."
+        if command in {"quit", "exit"}:
+            return "Telegram bot commands cannot terminate the deployed service."
+        if command in {"copy", "mention", "theme", "title", "statusline", "feedback", "apps", "plugins", "realtime", "settings", "agent", "subagents", "collab", "plan", "skills", "approvals", "permissions", "setup_default_sandbox", "sandbox_add_read_dir", "experimental", "fast", "personality", "ps", "stop", "rollout", "debug_config", "debug_m_drop", "debug_m_update", "test_approval", "logout"}:
+            return textwrap.dedent(
+                f"""\
+                /{command} is registered for parity with Codex slash commands,
+                but this command is currently TUI-specific or not yet implemented for Telegram.
+                """
+            ).strip()
+        return f"/{command} is not implemented for Telegram yet."
 
     def _is_allowed(self, message: InboundMessage) -> bool:
         allowed_chat_ids = self._config.telegram.allowed_chat_ids
