@@ -35,6 +35,11 @@ _HOP_BY_HOP_HEADERS = {
 }
 
 _LOCAL_WARMUP_RESPONSE_ID_PREFIX = "bridge_warmup_"
+_TOOL_CALL_TYPE_BY_OUTPUT_TYPE = {
+    "function_call_output": "function_call",
+    "custom_tool_call_output": "custom_tool_call",
+}
+_TOOL_CALL_TYPES = set(_TOOL_CALL_TYPE_BY_OUTPUT_TYPE.values())
 
 
 @dataclass(frozen=True)
@@ -120,7 +125,7 @@ def _rewrite_previous_response_id(
     if isinstance(base_input, list) and isinstance(current_input, list):
         rewritten["input"] = (
             copy.deepcopy(base_input)
-            + _matching_function_call_items(
+            + _matching_tool_call_items(
                 current_input,
                 prior_response_items.get(previous_response_id, []),
             )
@@ -136,29 +141,85 @@ def _rewrite_previous_response_id(
     return rewritten
 
 
-def _matching_function_call_items(
+def _matching_tool_call_items(
     current_input: list[dict[str, Any]],
     prior_response_items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    call_ids = {
-        call_id
+    wanted_calls = {
+        (call_type, call_id)
         for item in current_input
-        if item.get("type") == "function_call_output"
+        if isinstance(call_type := _TOOL_CALL_TYPE_BY_OUTPUT_TYPE.get(str(item.get("type"))), str)
         and isinstance(call_id := item.get("call_id"), str)
     }
     matched_items: list[dict[str, Any]] = []
-    seen_call_ids: set[str] = set()
+    seen_calls: set[tuple[str, str]] = set()
     for item in prior_response_items:
+        item_type = item.get("type")
         call_id = item.get("call_id")
+        call_key = (item_type, call_id)
         if (
-            item.get("type") == "function_call"
+            isinstance(item_type, str)
             and isinstance(call_id, str)
-            and call_id in call_ids
-            and call_id not in seen_call_ids
+            and call_key in wanted_calls
+            and call_key not in seen_calls
         ):
             matched_items.append(copy.deepcopy(item))
-            seen_call_ids.add(call_id)
+            seen_calls.add(call_key)
     return matched_items
+
+
+def _restore_missing_tool_call_items(
+    payload: dict[str, Any],
+    prior_tool_call_items: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, Any]:
+    input_items = payload.get("input")
+    if not isinstance(input_items, list):
+        return copy.deepcopy(payload)
+
+    existing_calls = {
+        (item_type, call_id)
+        for item in input_items
+        if isinstance(item, dict)
+        and isinstance(item_type := item.get("type"), str)
+        and item_type in _TOOL_CALL_TYPES
+        and isinstance(call_id := item.get("call_id"), str)
+    }
+    inserted_calls: set[tuple[str, str]] = set()
+    restored_input: list[Any] = []
+    for item in input_items:
+        if isinstance(item, dict):
+            item_type = item.get("type")
+            call_type = _TOOL_CALL_TYPE_BY_OUTPUT_TYPE.get(str(item_type))
+            call_id = item.get("call_id")
+            call_key = (call_type, call_id)
+            if (
+                isinstance(call_type, str)
+                and isinstance(call_id, str)
+                and call_key not in existing_calls
+                and call_key not in inserted_calls
+                and call_key in prior_tool_call_items
+            ):
+                restored_input.append(copy.deepcopy(prior_tool_call_items[call_key]))
+                inserted_calls.add(call_key)
+        restored_input.append(copy.deepcopy(item))
+
+    if not inserted_calls:
+        return copy.deepcopy(payload)
+
+    restored_payload = copy.deepcopy(payload)
+    restored_payload["input"] = restored_input
+    return restored_payload
+
+
+def _cache_tool_call_items(
+    items: list[dict[str, Any]],
+    prior_tool_call_items: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    for item in items:
+        item_type = item.get("type")
+        call_id = item.get("call_id")
+        if isinstance(item_type, str) and item_type in _TOOL_CALL_TYPES and isinstance(call_id, str):
+            prior_tool_call_items[(item_type, call_id)] = copy.deepcopy(item)
 
 
 class ResponsesBridge:
@@ -279,6 +340,7 @@ class ResponsesBridge:
             await websocket.accept()
             prior_requests: dict[str, dict[str, Any]] = {}
             prior_response_items: dict[str, list[dict[str, Any]]] = {}
+            prior_tool_call_items: dict[tuple[str, str], dict[str, Any]] = {}
             try:
                 while True:
                     request_text = await websocket.receive_text()
@@ -314,11 +376,16 @@ class ResponsesBridge:
                         prior_requests,
                         prior_response_items,
                     )
+                    upstream_payload = _restore_missing_tool_call_items(
+                        upstream_payload,
+                        prior_tool_call_items,
+                    )
                     await self._stream_upstream_sse(
                         websocket,
                         upstream_payload,
                         prior_requests,
                         prior_response_items,
+                        prior_tool_call_items,
                     )
             except WebSocketDisconnect:
                 return
@@ -367,6 +434,7 @@ class ResponsesBridge:
         payload: dict[str, Any],
         prior_requests: dict[str, dict[str, Any]],
         prior_response_items: dict[str, list[dict[str, Any]]],
+        prior_tool_call_items: dict[tuple[str, str], dict[str, Any]],
     ) -> None:
         upstream_payload = dict(payload)
         upstream_payload["stream"] = True
@@ -435,9 +503,9 @@ class ResponsesBridge:
                                 if not isinstance(item_response_id, str):
                                     item_response_id = response_id
                                 if isinstance(item_response_id, str):
-                                    prior_response_items.setdefault(item_response_id, []).append(
-                                        copy.deepcopy(item)
-                                    )
+                                    item_copy = copy.deepcopy(item)
+                                    prior_response_items.setdefault(item_response_id, []).append(item_copy)
+                                    _cache_tool_call_items([item_copy], prior_tool_call_items)
                         await websocket.send_text(data)
                         continue
                     if line.startswith("data:"):

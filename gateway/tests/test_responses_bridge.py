@@ -11,6 +11,7 @@ from codex_gateway.responses_bridge import (
     BridgeConfig,
     ResponsesBridge,
     _rewrite_previous_response_id,
+    _restore_missing_tool_call_items,
     _ws_request_to_responses_payload,
 )
 
@@ -320,6 +321,99 @@ def test_rewrite_previous_response_id_expands_real_response_context() -> None:
     }
 
 
+def test_rewrite_previous_response_id_expands_custom_tool_context() -> None:
+    prior_requests = {
+        "resp-1": {
+            "model": "gpt-5.2-codex",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            "stream": True,
+        }
+    }
+    prior_response_items = {
+        "resp-1": [
+            {
+                "id": "ctc-1",
+                "type": "custom_tool_call",
+                "call_id": "call-1",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** End Patch",
+                "status": "completed",
+            }
+        ]
+    }
+
+    rewritten = _rewrite_previous_response_id(
+        {
+            "model": "gpt-5.2-codex",
+            "previous_response_id": "resp-1",
+            "input": [{"type": "custom_tool_call_output", "call_id": "call-1", "output": "ok"}],
+            "stream": True,
+        },
+        prior_requests,
+        prior_response_items,
+    )
+
+    assert rewritten == {
+        "model": "gpt-5.2-codex",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            {
+                "id": "ctc-1",
+                "type": "custom_tool_call",
+                "call_id": "call-1",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** End Patch",
+                "status": "completed",
+            },
+            {"type": "custom_tool_call_output", "call_id": "call-1", "output": "ok"},
+        ],
+        "stream": True,
+    }
+
+
+def test_restore_missing_tool_call_items_fills_orphan_custom_tool_output() -> None:
+    restored = _restore_missing_tool_call_items(
+        {
+            "model": "gpt-5.2-codex",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "cloudflare"}]},
+                {"type": "custom_tool_call_output", "call_id": "call-1", "output": "ok"},
+            ],
+            "stream": True,
+        },
+        {
+            (
+                "custom_tool_call",
+                "call-1",
+            ): {
+                "id": "ctc-1",
+                "type": "custom_tool_call",
+                "call_id": "call-1",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** End Patch",
+                "status": "completed",
+            }
+        },
+    )
+
+    assert restored == {
+        "model": "gpt-5.2-codex",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "cloudflare"}]},
+            {
+                "id": "ctc-1",
+                "type": "custom_tool_call",
+                "call_id": "call-1",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** End Patch",
+                "status": "completed",
+            },
+            {"type": "custom_tool_call_output", "call_id": "call-1", "output": "ok"},
+        ],
+        "stream": True,
+    }
+
+
 def test_bridge_websocket_rewrites_real_previous_response_function_calls() -> None:
     requests: list[dict[str, object]] = []
 
@@ -414,6 +508,112 @@ def test_bridge_websocket_rewrites_real_previous_response_function_calls() -> No
                         "status": "completed",
                     },
                     {"type": "function_call_output", "call_id": "call-1", "output": "ok"},
+                ],
+                "stream": True,
+            },
+        ]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_bridge_websocket_restores_orphan_custom_tool_calls_without_previous_response_id() -> None:
+    requests: list[dict[str, object]] = []
+
+    class UpstreamHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            if self.path != "/v1/responses":
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")) or 0)
+            requests.append(json.loads(body))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            if len(requests) == 1:
+                self.wfile.write(b"event: response.created\n")
+                self.wfile.write(b'data: {"type":"response.created","response":{"id":"resp-1"}}\n\n')
+                self.wfile.write(b"event: response.output_item.done\n")
+                self.wfile.write(
+                    b'data: {"type":"response.output_item.done","response_id":"resp-1","item":{"id":"ctc-1","type":"custom_tool_call","call_id":"call-1","name":"apply_patch","input":"*** Begin Patch\\n*** End Patch","status":"completed"}}\n\n'
+                )
+                self.wfile.write(b"event: response.completed\n")
+                self.wfile.write(
+                    b'data: {"type":"response.completed","response":{"id":"resp-1","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n'
+                )
+                return
+
+            self.wfile.write(b"event: response.created\n")
+            self.wfile.write(b'data: {"type":"response.created","response":{"id":"resp-2"}}\n\n')
+            self.wfile.write(b"event: response.completed\n")
+            self.wfile.write(
+                b'data: {"type":"response.completed","response":{"id":"resp-2","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}\n\n'
+            )
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        bridge = ResponsesBridge(
+            BridgeConfig(
+                upstream_base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                upstream_api_key="test-key",
+            )
+        )
+        client = TestClient(bridge.app)
+
+        with client.websocket_connect("/v1/responses") as websocket:
+            websocket.send_json(
+                {
+                    "type": "response.create",
+                    "model": "gpt-5.2-codex",
+                    "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+                    "stream": True,
+                }
+            )
+            assert websocket.receive_json()["type"] == "response.created"
+            assert websocket.receive_json()["type"] == "response.output_item.done"
+            assert websocket.receive_json()["type"] == "response.completed"
+
+            websocket.send_json(
+                {
+                    "type": "response.create",
+                    "model": "gpt-5.2-codex",
+                    "input": [
+                        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "cloudflare"}]},
+                        {"type": "custom_tool_call_output", "call_id": "call-1", "output": "ok"},
+                    ],
+                    "stream": True,
+                }
+            )
+            assert websocket.receive_json()["type"] == "response.created"
+            assert websocket.receive_json()["type"] == "response.completed"
+
+        assert requests == [
+            {
+                "model": "gpt-5.2-codex",
+                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+                "stream": True,
+            },
+            {
+                "model": "gpt-5.2-codex",
+                "input": [
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "cloudflare"}]},
+                    {
+                        "id": "ctc-1",
+                        "type": "custom_tool_call",
+                        "call_id": "call-1",
+                        "name": "apply_patch",
+                        "input": "*** Begin Patch\n*** End Patch",
+                        "status": "completed",
+                    },
+                    {"type": "custom_tool_call_output", "call_id": "call-1", "output": "ok"},
                 ],
                 "stream": True,
             },
