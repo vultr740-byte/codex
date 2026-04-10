@@ -7,7 +7,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 from starlette.testclient import TestClient
 
-from codex_gateway.responses_bridge import BridgeConfig, ResponsesBridge, _ws_request_to_responses_payload
+from codex_gateway.responses_bridge import (
+    BridgeConfig,
+    ResponsesBridge,
+    _rewrite_previous_response_id,
+    _ws_request_to_responses_payload,
+)
 
 
 def test_ws_request_to_responses_payload_drops_type() -> None:
@@ -257,6 +262,41 @@ def test_bridge_websocket_rewrites_synthetic_previous_response_id() -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_rewrite_previous_response_id_expands_real_response_context() -> None:
+    prior_requests = {
+        "resp-1": {
+            "model": "gpt-5.2-codex",
+            "instructions": "system",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            "tools": [{"type": "function", "name": "shell"}],
+            "store": False,
+            "stream": True,
+        }
+    }
+
+    rewritten = _rewrite_previous_response_id(
+        {
+            "model": "gpt-5.2-codex",
+            "previous_response_id": "resp-1",
+            "input": [{"type": "function_call_output", "call_id": "call-1", "output": "ok"}],
+            "stream": True,
+        },
+        prior_requests,
+    )
+
+    assert rewritten == {
+        "model": "gpt-5.2-codex",
+        "instructions": "system",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            {"type": "function_call_output", "call_id": "call-1", "output": "ok"},
+        ],
+        "tools": [{"type": "function", "name": "shell"}],
+        "store": False,
+        "stream": True,
+    }
 
 
 def test_bridge_models_proxies_response() -> None:

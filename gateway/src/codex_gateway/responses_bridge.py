@@ -93,29 +93,37 @@ def _local_warmup_response_id() -> str:
     return f"{_LOCAL_WARMUP_RESPONSE_ID_PREFIX}{uuid.uuid4().hex}"
 
 
-def _rewrite_synthetic_previous_response_id(
+def _rewrite_previous_response_id(
     payload: dict[str, Any],
-    synthetic_requests: dict[str, dict[str, Any]],
+    prior_requests: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     previous_response_id = payload.get("previous_response_id")
     if not isinstance(previous_response_id, str):
         return copy.deepcopy(payload)
-    if not previous_response_id.startswith(_LOCAL_WARMUP_RESPONSE_ID_PREFIX):
+
+    base_request = prior_requests.get(previous_response_id)
+    if base_request is None:
+        if previous_response_id.startswith(_LOCAL_WARMUP_RESPONSE_ID_PREFIX):
+            raise ValueError(f"Unknown synthetic previous_response_id: {previous_response_id}")
         return copy.deepcopy(payload)
 
-    base_request = synthetic_requests.get(previous_response_id)
-    if base_request is None:
-        raise ValueError(f"Unknown synthetic previous_response_id: {previous_response_id}")
-
-    rewritten = copy.deepcopy(payload)
-    rewritten.pop("previous_response_id", None)
+    rewritten = copy.deepcopy(base_request)
+    rewritten.pop("generate", None)
+    for key, value in payload.items():
+        if key in {"input", "previous_response_id"}:
+            continue
+        rewritten[key] = copy.deepcopy(value)
 
     base_input = base_request.get("input")
-    current_input = rewritten.get("input")
+    current_input = payload.get("input")
     if isinstance(base_input, list) and isinstance(current_input, list):
         rewritten["input"] = copy.deepcopy(base_input) + copy.deepcopy(current_input)
     elif isinstance(base_input, list):
         rewritten["input"] = copy.deepcopy(base_input)
+    elif current_input is not None:
+        rewritten["input"] = copy.deepcopy(current_input)
+
+    rewritten.pop("previous_response_id", None)
 
     return rewritten
 
@@ -236,7 +244,7 @@ class ResponsesBridge:
 
         async def responses_ws(websocket: WebSocket) -> None:
             await websocket.accept()
-            synthetic_requests: dict[str, dict[str, Any]] = {}
+            prior_requests: dict[str, dict[str, Any]] = {}
             try:
                 while True:
                     request_text = await websocket.receive_text()
@@ -244,7 +252,7 @@ class ResponsesBridge:
                     upstream_payload = _ws_request_to_responses_payload(payload)
                     if _is_local_warmup_request(upstream_payload):
                         response_id = _local_warmup_response_id()
-                        synthetic_requests[response_id] = copy.deepcopy(upstream_payload)
+                        prior_requests[response_id] = copy.deepcopy(upstream_payload)
                         await websocket.send_text(
                             json.dumps(
                                 {
@@ -266,11 +274,11 @@ class ResponsesBridge:
                             )
                         )
                         continue
-                    upstream_payload = _rewrite_synthetic_previous_response_id(
+                    upstream_payload = _rewrite_previous_response_id(
                         upstream_payload,
-                        synthetic_requests,
+                        prior_requests,
                     )
-                    await self._stream_upstream_sse(websocket, upstream_payload)
+                    await self._stream_upstream_sse(websocket, upstream_payload, prior_requests)
             except WebSocketDisconnect:
                 return
             except ValueError as exc:
@@ -312,7 +320,12 @@ class ResponsesBridge:
             ]
         )
 
-    async def _stream_upstream_sse(self, websocket: WebSocket, payload: dict[str, Any]) -> None:
+    async def _stream_upstream_sse(
+        self,
+        websocket: WebSocket,
+        payload: dict[str, Any],
+        prior_requests: dict[str, dict[str, Any]],
+    ) -> None:
         upstream_payload = dict(payload)
         upstream_payload["stream"] = True
         url = f"{self._config.upstream_base_url}/responses"
@@ -328,6 +341,13 @@ class ResponsesBridge:
                         detail = json.loads(body.decode("utf-8"))
                     except Exception:
                         detail = {"message": body.decode("utf-8", errors="replace")}
+                    logger.warning(
+                        "upstream responses request failed status=%s previous_response_id=%s input_items=%s detail=%s",
+                        response.status_code,
+                        payload.get("previous_response_id"),
+                        len(payload.get("input", [])) if isinstance(payload.get("input"), list) else None,
+                        detail,
+                    )
                     await websocket.send_text(
                         json.dumps(
                             {
@@ -353,6 +373,16 @@ class ResponsesBridge:
                         data_lines.clear()
                         if not data or data == "[DONE]":
                             continue
+                        try:
+                            event = json.loads(data)
+                        except json.JSONDecodeError:
+                            event = None
+                        if isinstance(event, dict) and event.get("type") == "response.created":
+                            response_obj = event.get("response")
+                            if isinstance(response_obj, dict):
+                                response_id = response_obj.get("id")
+                                if isinstance(response_id, str):
+                                    prior_requests[response_id] = copy.deepcopy(payload)
                         await websocket.send_text(data)
                         continue
                     if line.startswith("data:"):

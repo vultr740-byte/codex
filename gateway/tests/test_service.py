@@ -62,7 +62,7 @@ def _config(tmp_path: Path) -> GatewayConfig:
         openai_base_url="https://example.test/v1",
         codex_model="gpt-5.2-codex",
         codex_approval_policy="never",
-        codex_sandbox_mode="workspace-write",
+        codex_sandbox_mode="danger-full-access",
         codex_bin=None,
         telegram=TelegramConfig(
             bot_token="token",

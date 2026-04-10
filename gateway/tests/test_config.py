@@ -36,6 +36,7 @@ def test_load_config_defaults_approval_policy_to_never(tmp_path, monkeypatch: py
     monkeypatch.setenv("CODEX_WORKING_DIR", str(tmp_path / "workspace"))
     config = load_config()
     assert config.codex_approval_policy == "never"
+    assert config.codex_sandbox_mode == "danger-full-access"
     assert config.sqlite_path == tmp_path / "gateway.sqlite"
     assert config.codex_home == tmp_path / "codex-home"
     assert config.codex_working_dir == (tmp_path / "workspace").resolve()

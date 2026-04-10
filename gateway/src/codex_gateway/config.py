@@ -124,7 +124,7 @@ def load_config() -> GatewayConfig:
         openai_base_url=openai_base_url,
         codex_model=os.getenv("CODEX_MODEL", "gpt-5.2-codex").strip(),
         codex_approval_policy=os.getenv("CODEX_APPROVAL_POLICY", "never").strip(),
-        codex_sandbox_mode=os.getenv("CODEX_SANDBOX_MODE", "workspace-write").strip(),
+        codex_sandbox_mode=os.getenv("CODEX_SANDBOX_MODE", "danger-full-access").strip(),
         codex_bin=os.getenv("CODEX_BIN", "").strip() or None,
         telegram=TelegramConfig(
             bot_token=telegram_token,
