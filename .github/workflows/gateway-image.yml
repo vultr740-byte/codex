@@ -28,10 +28,10 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@e468c3f398742df0a19c6176e84a7ab31d3c30b4 # v3
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@465a07811f14bebb1938fbed4728c6a1ff8901fc # v3
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -39,7 +39,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5
+        uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -49,7 +49,7 @@ jobs:
             type=raw,value=${{ inputs.image_tag }},enable=${{ inputs.image_tag != '' }}
 
       - name: Build and push gateway image
-        uses: docker/build-push-action@4f58ea79222b3b9dc2a14c9e2d8f4f9f6f6b3a3d # v6
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: gateway/Dockerfile
