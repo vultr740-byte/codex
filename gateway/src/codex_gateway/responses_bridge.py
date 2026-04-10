@@ -96,6 +96,7 @@ def _local_warmup_response_id() -> str:
 def _rewrite_previous_response_id(
     payload: dict[str, Any],
     prior_requests: dict[str, dict[str, Any]],
+    prior_response_items: dict[str, list[dict[str, Any]]],
 ) -> dict[str, Any]:
     previous_response_id = payload.get("previous_response_id")
     if not isinstance(previous_response_id, str):
@@ -117,7 +118,14 @@ def _rewrite_previous_response_id(
     base_input = base_request.get("input")
     current_input = payload.get("input")
     if isinstance(base_input, list) and isinstance(current_input, list):
-        rewritten["input"] = copy.deepcopy(base_input) + copy.deepcopy(current_input)
+        rewritten["input"] = (
+            copy.deepcopy(base_input)
+            + _matching_function_call_items(
+                current_input,
+                prior_response_items.get(previous_response_id, []),
+            )
+            + copy.deepcopy(current_input)
+        )
     elif isinstance(base_input, list):
         rewritten["input"] = copy.deepcopy(base_input)
     elif current_input is not None:
@@ -126,6 +134,31 @@ def _rewrite_previous_response_id(
     rewritten.pop("previous_response_id", None)
 
     return rewritten
+
+
+def _matching_function_call_items(
+    current_input: list[dict[str, Any]],
+    prior_response_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    call_ids = {
+        call_id
+        for item in current_input
+        if item.get("type") == "function_call_output"
+        and isinstance(call_id := item.get("call_id"), str)
+    }
+    matched_items: list[dict[str, Any]] = []
+    seen_call_ids: set[str] = set()
+    for item in prior_response_items:
+        call_id = item.get("call_id")
+        if (
+            item.get("type") == "function_call"
+            and isinstance(call_id, str)
+            and call_id in call_ids
+            and call_id not in seen_call_ids
+        ):
+            matched_items.append(copy.deepcopy(item))
+            seen_call_ids.add(call_id)
+    return matched_items
 
 
 class ResponsesBridge:
@@ -245,6 +278,7 @@ class ResponsesBridge:
         async def responses_ws(websocket: WebSocket) -> None:
             await websocket.accept()
             prior_requests: dict[str, dict[str, Any]] = {}
+            prior_response_items: dict[str, list[dict[str, Any]]] = {}
             try:
                 while True:
                     request_text = await websocket.receive_text()
@@ -253,6 +287,7 @@ class ResponsesBridge:
                     if _is_local_warmup_request(upstream_payload):
                         response_id = _local_warmup_response_id()
                         prior_requests[response_id] = copy.deepcopy(upstream_payload)
+                        prior_response_items[response_id] = []
                         await websocket.send_text(
                             json.dumps(
                                 {
@@ -277,8 +312,14 @@ class ResponsesBridge:
                     upstream_payload = _rewrite_previous_response_id(
                         upstream_payload,
                         prior_requests,
+                        prior_response_items,
                     )
-                    await self._stream_upstream_sse(websocket, upstream_payload, prior_requests)
+                    await self._stream_upstream_sse(
+                        websocket,
+                        upstream_payload,
+                        prior_requests,
+                        prior_response_items,
+                    )
             except WebSocketDisconnect:
                 return
             except ValueError as exc:
@@ -325,6 +366,7 @@ class ResponsesBridge:
         websocket: WebSocket,
         payload: dict[str, Any],
         prior_requests: dict[str, dict[str, Any]],
+        prior_response_items: dict[str, list[dict[str, Any]]],
     ) -> None:
         upstream_payload = dict(payload)
         upstream_payload["stream"] = True
@@ -332,6 +374,7 @@ class ResponsesBridge:
         headers = _build_upstream_headers(websocket.headers, self._config.upstream_api_key)
         headers["Accept"] = "text/event-stream"
         headers["Content-Type"] = "application/json"
+        response_id: str | None = None
 
         async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
             async with client.stream("POST", url, headers=headers, json=upstream_payload) as response:
@@ -380,9 +423,21 @@ class ResponsesBridge:
                         if isinstance(event, dict) and event.get("type") == "response.created":
                             response_obj = event.get("response")
                             if isinstance(response_obj, dict):
-                                response_id = response_obj.get("id")
-                                if isinstance(response_id, str):
+                                created_response_id = response_obj.get("id")
+                                if isinstance(created_response_id, str):
+                                    response_id = created_response_id
                                     prior_requests[response_id] = copy.deepcopy(payload)
+                                    prior_response_items.setdefault(response_id, [])
+                        if isinstance(event, dict) and event.get("type") == "response.output_item.done":
+                            item = event.get("item")
+                            if isinstance(item, dict):
+                                item_response_id = event.get("response_id")
+                                if not isinstance(item_response_id, str):
+                                    item_response_id = response_id
+                                if isinstance(item_response_id, str):
+                                    prior_response_items.setdefault(item_response_id, []).append(
+                                        copy.deepcopy(item)
+                                    )
                         await websocket.send_text(data)
                         continue
                     if line.startswith("data:"):
