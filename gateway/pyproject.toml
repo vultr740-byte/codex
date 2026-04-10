@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codex-telegram-gateway"
+version = "0.1.0"
+description = "Telegram gateway for Codex app-server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "OpenAI" }]
+dependencies = [
+  "httpx>=0.28",
+  "pydantic>=2.12",
+  "starlette>=0.46",
+  "uvicorn>=0.34",
+  "websockets>=15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_gateway"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
