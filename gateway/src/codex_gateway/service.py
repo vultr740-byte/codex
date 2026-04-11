@@ -251,6 +251,7 @@ class GatewayService:
                 stream_loop.start()
             try:
                 session = self._db.get_session(channel="telegram", external_chat_id=str(message.chat_id))
+                model = self._effective_model_for_chat(message.chat_id)
 
                 def on_delta(delta: str) -> None:
                     nonlocal delta_chars, delta_count, first_delta_at
@@ -271,6 +272,7 @@ class GatewayService:
                     thread_id=session.codex_thread_id if session else None,
                     prompt=message.text,
                     on_delta=on_delta,
+                    model=model,
                 )
                 completed_at = time.monotonic()
                 logger.info(
@@ -343,12 +345,25 @@ class GatewayService:
         except TelegramApiError:
             logger.exception("failed to register telegram commands")
 
+    def _effective_model_for_chat(self, chat_id: int) -> str:
+        preferences = self._db.get_preferences(channel="telegram", external_chat_id=str(chat_id))
+        if preferences is not None and preferences.model:
+            return preferences.model
+        return self._config.codex_model
+
+    def _save_model_for_chat(self, chat_id: int, model: str | None) -> None:
+        self._db.save_preferences(
+            channel="telegram",
+            external_chat_id=str(chat_id),
+            model=model,
+        )
+
     def _process_command_message(self, message: InboundMessage) -> None:
         command = message.command or ""
         args = message.command_args.strip()
         try:
             if command == "new":
-                thread = self._codex_runner.new_thread()
+                thread = self._codex_runner.new_thread(model=self._effective_model_for_chat(message.chat_id))
                 self._db.save_session(
                     channel="telegram",
                     external_chat_id=str(message.chat_id),
@@ -374,7 +389,10 @@ class GatewayService:
                 return
 
             if command == "fork":
-                forked = self._codex_runner.fork_thread(thread_id=session.codex_thread_id)  # type: ignore[union-attr]
+                forked = self._codex_runner.fork_thread(
+                    thread_id=session.codex_thread_id,  # type: ignore[union-attr]
+                    model=self._effective_model_for_chat(message.chat_id),
+                )
                 self._db.save_session(
                     channel="telegram",
                     external_chat_id=str(message.chat_id),
@@ -434,12 +452,13 @@ class GatewayService:
 
             if command == "status":
                 info = self._codex_runner.read_thread(thread_id=session.codex_thread_id)  # type: ignore[union-attr]
+                effective_model = self._effective_model_for_chat(message.chat_id)
                 lines = [
                     f"thread_id: {info.thread_id}",
                     f"name: {info.name or '(untitled)'}",
                     f"preview: {info.preview or '(empty)'}",
                     f"cwd: {info.cwd}",
-                    f"model: {self._config.codex_model}",
+                    f"model: {effective_model}",
                     f"approval_policy: {self._config.codex_approval_policy}",
                     f"sandbox_mode: {self._config.codex_sandbox_mode}",
                 ]
@@ -447,10 +466,46 @@ class GatewayService:
                 return
 
             if command == "model":
+                if not args or args in {"current", "show", "status"}:
+                    lines = [
+                        f"Current model: {self._effective_model_for_chat(message.chat_id)}",
+                        "",
+                        "Usage:",
+                        "/model list",
+                        "/model <model-id>",
+                    ]
+                    self._telegram.send_message(chat_id=message.chat_id, text="\n".join(lines))
+                    return
+
                 models = self._codex_runner.list_models()
+                if args == "list":
+                    current_model = self._effective_model_for_chat(message.chat_id)
+                    lines = ["Available models:"]
+                    for model in models[:40]:
+                        marker = " (current)" if model == current_model else ""
+                        lines.append(f"- {model}{marker}")
+                    self._telegram.send_message(chat_id=message.chat_id, text="\n".join(lines))
+                    return
+
+                if args == "reset":
+                    self._save_model_for_chat(message.chat_id, None)
+                    self._telegram.send_message(
+                        chat_id=message.chat_id,
+                        text=f"Model reset to default: {self._config.codex_model}",
+                    )
+                    return
+
+                if args not in models:
+                    self._telegram.send_message(
+                        chat_id=message.chat_id,
+                        text=f"Unknown model: {args}\nUse /model list to see available models.",
+                    )
+                    return
+
+                self._save_model_for_chat(message.chat_id, args)
                 self._telegram.send_message(
                     chat_id=message.chat_id,
-                    text="Available models:\n" + "\n".join(f"- {model}" for model in models[:40]),
+                    text=f"Model changed to {args}",
                 )
                 return
 

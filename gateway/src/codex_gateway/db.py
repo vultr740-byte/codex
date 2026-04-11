@@ -14,6 +14,13 @@ class SessionBinding:
     codex_thread_id: str
 
 
+@dataclass(frozen=True)
+class ChatPreferences:
+    channel: str
+    external_chat_id: str
+    model: str | None
+
+
 class GatewayDb:
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -46,6 +53,18 @@ class GatewayDb:
                     external_message_id TEXT NOT NULL,
                     received_at INTEGER NOT NULL,
                     PRIMARY KEY (channel, external_chat_id, external_message_id)
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS channel_preferences (
+                    channel TEXT NOT NULL,
+                    external_chat_id TEXT NOT NULL,
+                    model TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (channel, external_chat_id)
                 )
                 """
             )
@@ -112,4 +131,42 @@ class GatewayDb:
                     updated_at = excluded.updated_at
                 """,
                 (channel, external_chat_id, codex_thread_id, now, now),
+            )
+
+    def get_preferences(self, *, channel: str, external_chat_id: str) -> ChatPreferences | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT channel, external_chat_id, model
+                FROM channel_preferences
+                WHERE channel = ? AND external_chat_id = ?
+                """,
+                (channel, external_chat_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return ChatPreferences(
+            channel=row["channel"],
+            external_chat_id=row["external_chat_id"],
+            model=row["model"],
+        )
+
+    def save_preferences(self, *, channel: str, external_chat_id: str, model: str | None) -> None:
+        now = int(time.time())
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO channel_preferences (
+                    channel,
+                    external_chat_id,
+                    model,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(channel, external_chat_id)
+                DO UPDATE SET
+                    model = excluded.model,
+                    updated_at = excluded.updated_at
+                """,
+                (channel, external_chat_id, model, now, now),
             )

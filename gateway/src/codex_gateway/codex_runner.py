@@ -114,7 +114,9 @@ class CodexRunner:
         thread_id: str | None,
         prompt: str,
         on_delta: Callable[[str], None],
+        model: str | None = None,
     ) -> CodexTurnResult:
+        effective_model = model or self._model
         client = AppServerClient(
             config=self._app_server_config,
             approval_handler=_deny_approval,
@@ -125,7 +127,7 @@ class CodexRunner:
             if thread_id is None:
                 started = client.thread_start(
                     {
-                        "model": self._model,
+                        "model": effective_model,
                         "cwd": self._app_server_config.cwd,
                         "approvalPolicy": self._approval_policy.root.value,
                         "sandbox": self._sandbox_mode.value,
@@ -137,7 +139,7 @@ class CodexRunner:
                     thread_id,
                     {
                         "threadId": thread_id,
-                        "model": self._model,
+                        "model": effective_model,
                         "cwd": self._app_server_config.cwd,
                         "approvalPolicy": self._approval_policy.root.value,
                         "sandbox": self._sandbox_mode.value,
@@ -153,7 +155,7 @@ class CodexRunner:
                     "input": [{"type": "text", "text": prompt}],
                     "approvalPolicy": self._approval_policy.root.value,
                     "cwd": self._app_server_config.cwd,
-                    "model": self._model,
+                    "model": effective_model,
                 },
             )
 
@@ -207,7 +209,8 @@ class CodexRunner:
         finally:
             client.close()
 
-    def new_thread(self) -> CodexThreadInfo:
+    def new_thread(self, *, model: str | None = None) -> CodexThreadInfo:
+        effective_model = model or self._model
         client = AppServerClient(
             config=self._app_server_config,
             approval_handler=_deny_approval,
@@ -217,7 +220,7 @@ class CodexRunner:
             client.initialize()
             started = client.thread_start(
                 {
-                    "model": self._model,
+                    "model": effective_model,
                     "cwd": self._app_server_config.cwd,
                     "approvalPolicy": self._approval_policy.root.value,
                     "sandbox": self._sandbox_mode.value,
@@ -245,7 +248,8 @@ class CodexRunner:
         finally:
             client.close()
 
-    def fork_thread(self, *, thread_id: str) -> CodexThreadInfo:
+    def fork_thread(self, *, thread_id: str, model: str | None = None) -> CodexThreadInfo:
+        effective_model = model or self._model
         client = AppServerClient(
             config=self._app_server_config,
             approval_handler=_deny_approval,
@@ -257,7 +261,7 @@ class CodexRunner:
                 thread_id,
                 {
                     "threadId": thread_id,
-                    "model": self._model,
+                    "model": effective_model,
                     "cwd": self._app_server_config.cwd,
                     "approvalPolicy": self._approval_policy.root.value,
                     "sandbox": self._sandbox_mode.value,
