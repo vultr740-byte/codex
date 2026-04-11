@@ -21,13 +21,15 @@ def test_session_round_trip(tmp_path: Path) -> None:
 
 def test_preferences_round_trip_and_reset(tmp_path: Path) -> None:
     db = GatewayDb(tmp_path / "gateway.sqlite")
-    db.save_preferences(channel="telegram", external_chat_id="42", model="gpt-5.4")
+    db.save_preferences(channel="telegram", external_chat_id="42", model="gpt-5.4", reasoning_effort="high")
 
     preferences = db.get_preferences(channel="telegram", external_chat_id="42")
     assert preferences is not None
     assert preferences.model == "gpt-5.4"
+    assert preferences.reasoning_effort == "high"
 
-    db.save_preferences(channel="telegram", external_chat_id="42", model=None)
+    db.save_preferences(channel="telegram", external_chat_id="42", model=None, reasoning_effort=None)
     reset_preferences = db.get_preferences(channel="telegram", external_chat_id="42")
     assert reset_preferences is not None
     assert reset_preferences.model is None
+    assert reset_preferences.reasoning_effort is None

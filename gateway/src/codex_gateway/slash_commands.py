@@ -28,6 +28,7 @@ class ParsedTelegramCommand:
 
 _COMMAND_SPECS = (
     TelegramCommandSpec("model", "model", "model", "choose what model and reasoning effort to use"),
+    TelegramCommandSpec("reasoning", "reasoning", "reasoning", "choose the reasoning effort for the current model"),
     TelegramCommandSpec("fast", "fast", "fast", "toggle Fast mode to enable fastest inference at 2X plan usage", True),
     TelegramCommandSpec("approvals", "approvals", "approvals", "choose what Codex is allowed to do"),
     TelegramCommandSpec("permissions", "permissions", "permissions", "choose what Codex is allowed to do"),

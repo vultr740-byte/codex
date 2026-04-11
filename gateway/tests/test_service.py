@@ -50,36 +50,44 @@ class FakeTelegram:
 
 class FakeRunner:
     def __init__(self) -> None:
-        self.calls: list[tuple[str | None, str, str | None]] = []
-        self.new_thread_calls: list[str | None] = []
+        self.calls: list[tuple[str | None, str, str | None, str | None]] = []
+        self.new_thread_calls: list[tuple[str | None, str | None]] = []
         self.compact_calls: list[str] = []
-        self.fork_calls: list[tuple[str, str | None]] = []
+        self.fork_calls: list[tuple[str, str | None, str | None]] = []
         self.rename_calls: list[tuple[str, str]] = []
         self.read_calls: list[str] = []
         self.list_threads_calls = 0
         self.list_models_calls = 0
 
-    def run_turn(self, *, thread_id: str | None, prompt: str, on_delta, model: str | None = None):  # type: ignore[no-untyped-def]
-        self.calls.append((thread_id, prompt, model))
+    def run_turn(
+        self,
+        *,
+        thread_id: str | None,
+        prompt: str,
+        on_delta,
+        model: str | None = None,
+        effort: str | None = None,
+    ):  # type: ignore[no-untyped-def]
+        self.calls.append((thread_id, prompt, model, effort))
         on_delta("hello ")
         on_delta("world")
         from codex_gateway.codex_runner import CodexTurnResult
 
         return CodexTurnResult(thread_id="thr_1", final_text="hello world")
 
-    def new_thread(self, *, model: str | None = None):  # type: ignore[no-untyped-def]
+    def new_thread(self, *, model: str | None = None, effort: str | None = None):  # type: ignore[no-untyped-def]
         from codex_gateway.codex_runner import CodexThreadInfo
 
-        self.new_thread_calls.append(model)
+        self.new_thread_calls.append((model, effort))
         return CodexThreadInfo(thread_id="thr_new", name=None, preview="", cwd="/tmp")
 
     def compact_thread(self, *, thread_id: str) -> None:
         self.compact_calls.append(thread_id)
 
-    def fork_thread(self, *, thread_id: str, model: str | None = None):  # type: ignore[no-untyped-def]
+    def fork_thread(self, *, thread_id: str, model: str | None = None, effort: str | None = None):  # type: ignore[no-untyped-def]
         from codex_gateway.codex_runner import CodexThreadInfo
 
-        self.fork_calls.append((thread_id, model))
+        self.fork_calls.append((thread_id, model, effort))
         return CodexThreadInfo(thread_id="thr_fork", name=None, preview="forked", cwd="/tmp")
 
     def rename_thread(self, *, thread_id: str, name: str) -> None:
@@ -100,9 +108,22 @@ class FakeRunner:
             CodexThreadInfo(thread_id="thr_other", name="Other", preview="other", cwd="/tmp"),
         ]
 
-    def list_models(self) -> list[str]:
+    def list_models(self):  # type: ignore[no-untyped-def]
+        from codex_gateway.codex_runner import CodexModelInfo
+
         self.list_models_calls += 1
-        return ["gpt-5.2-codex", "gpt-5.4"]
+        return [
+            CodexModelInfo(
+                id="gpt-5.2-codex",
+                default_reasoning_effort="medium",
+                supported_reasoning_efforts=["low", "medium", "high"],
+            ),
+            CodexModelInfo(
+                id="gpt-5.4",
+                default_reasoning_effort="medium",
+                supported_reasoning_efforts=["minimal", "low", "medium", "high", "xhigh"],
+            ),
+        ]
 
 
 def _config(tmp_path: Path) -> GatewayConfig:
@@ -151,7 +172,7 @@ def test_service_processes_message_and_persists_thread(tmp_path: Path) -> None:
     assert service._telegram.actions  # type: ignore[attr-defined]
     assert service._telegram.actions[0] == (1, "typing")  # type: ignore[attr-defined]
     assert service._telegram.sent  # type: ignore[attr-defined]
-    assert service._codex_runner.calls == [(None, "fix the bug", "gpt-5.2-codex")]  # type: ignore[attr-defined]
+    assert service._codex_runner.calls == [(None, "fix the bug", "gpt-5.2-codex", None)]  # type: ignore[attr-defined]
 
 
 def test_run_forever_registers_telegram_commands_before_polling(tmp_path: Path) -> None:
@@ -200,7 +221,7 @@ def test_service_processes_new_command_without_running_turn(tmp_path: Path) -> N
     session = service._db.get_session(channel="telegram", external_chat_id="1")  # type: ignore[attr-defined]
     assert session is not None
     assert session.codex_thread_id == "thr_new"
-    assert runner.new_thread_calls == ["gpt-5.2-codex"]
+    assert runner.new_thread_calls == [("gpt-5.2-codex", None)]
     assert runner.calls == []
     assert telegram.sent == [(1, "Started a new thread.\nthread_id: thr_new")]
 
@@ -375,7 +396,7 @@ def test_service_sends_one_final_message_when_streaming_disabled(tmp_path: Path)
     assert telegram.actions
     assert telegram.sent == [(1, "hello world")]
     assert telegram.edited == []
-    assert service._codex_runner.calls == [(None, "fix the bug", "gpt-5.2-codex")]  # type: ignore[attr-defined]
+    assert service._codex_runner.calls == [(None, "fix the bug", "gpt-5.2-codex", None)]  # type: ignore[attr-defined]
 
 
 def test_service_processes_model_command_without_args(tmp_path: Path) -> None:
@@ -402,7 +423,7 @@ def test_service_processes_model_command_without_args(tmp_path: Path) -> None:
     assert telegram.sent == [
         (
             1,
-            "Current model: gpt-5.2-codex\n\nUsage:\n/model list\n/model <model-id>",
+            "Current model: gpt-5.2-codex\nCurrent reasoning: default\n\nUsage:\n/model list\n/model <model-id>\n/model <model-id> <reasoning>",
         )
     ]
 
@@ -432,7 +453,7 @@ def test_service_processes_model_list_command(tmp_path: Path) -> None:
     assert telegram.sent == [
         (
             1,
-            "Available models:\n- gpt-5.2-codex (current)\n- gpt-5.4",
+            "Available models:\n- gpt-5.2-codex (current) [default: medium; supported: low, medium, high]\n- gpt-5.4 [default: medium; supported: minimal, low, medium, high, xhigh]",
         )
     ]
 
@@ -459,7 +480,7 @@ def test_service_processes_model_set_and_uses_it_for_future_turns(tmp_path: Path
     )
 
     assert runner.list_models_calls == 1
-    assert telegram.sent == [(1, "Model changed to gpt-5.4")]
+    assert telegram.sent == [(1, "Model changed to gpt-5.4 medium")]
 
     service.process_message_for_test(
         InboundMessage(
@@ -472,7 +493,7 @@ def test_service_processes_model_set_and_uses_it_for_future_turns(tmp_path: Path
         ),
     )
 
-    assert runner.calls[-1] == (None, "say hi", "gpt-5.4")
+    assert runner.calls[-1] == (None, "say hi", "gpt-5.4", "medium")
 
 
 def test_service_rejects_unknown_model_name(tmp_path: Path) -> None:
@@ -549,4 +570,207 @@ def test_service_can_reset_model_to_default(tmp_path: Path) -> None:
     )
 
     assert telegram.sent[1] == (1, "Model reset to default: gpt-5.2-codex")
-    assert runner.calls[-1] == (None, "say hi", "gpt-5.2-codex")
+    assert runner.calls[-1] == (None, "say hi", "gpt-5.2-codex", "medium")
+
+
+def test_service_processes_model_with_explicit_reasoning(tmp_path: Path) -> None:
+    service = GatewayService(_config(tmp_path))
+    service._bridge = FakeBridge()  # type: ignore[attr-defined]
+    telegram = FakeTelegram()
+    runner = FakeRunner()
+    service._telegram = telegram  # type: ignore[attr-defined]
+    service._codex_runner = runner  # type: ignore[attr-defined]
+
+    service.process_message_for_test(
+        InboundMessage(
+            channel="telegram",
+            chat_id=1,
+            message_id=112,
+            user_id=200,
+            text="/model gpt-5.4 high",
+            is_group=False,
+            command="model",
+            command_args="gpt-5.4 high",
+        ),
+    )
+    service.process_message_for_test(
+        InboundMessage(
+            channel="telegram",
+            chat_id=1,
+            message_id=113,
+            user_id=200,
+            text="continue",
+            is_group=False,
+        ),
+    )
+
+    assert telegram.sent[0] == (1, "Model changed to gpt-5.4 high")
+    assert runner.calls[-1] == (None, "continue", "gpt-5.4", "high")
+
+
+def test_service_processes_reasoning_command_without_args(tmp_path: Path) -> None:
+    service = GatewayService(_config(tmp_path))
+    service._bridge = FakeBridge()  # type: ignore[attr-defined]
+    telegram = FakeTelegram()
+    runner = FakeRunner()
+    service._telegram = telegram  # type: ignore[attr-defined]
+    service._codex_runner = runner  # type: ignore[attr-defined]
+
+    service.process_message_for_test(
+        InboundMessage(
+            channel="telegram",
+            chat_id=1,
+            message_id=114,
+            user_id=200,
+            text="/reasoning",
+            is_group=False,
+            command="reasoning",
+        ),
+    )
+
+    assert telegram.sent == [
+        (
+            1,
+            "Current reasoning: default\nCurrent model: gpt-5.2-codex\nSupported: low, medium, high\nDefault for model: medium\n\nUsage:\n/reasoning list\n/reasoning <level>\n/reasoning reset",
+        )
+    ]
+
+
+def test_service_processes_reasoning_list_command(tmp_path: Path) -> None:
+    service = GatewayService(_config(tmp_path))
+    service._bridge = FakeBridge()  # type: ignore[attr-defined]
+    telegram = FakeTelegram()
+    runner = FakeRunner()
+    service._telegram = telegram  # type: ignore[attr-defined]
+    service._codex_runner = runner  # type: ignore[attr-defined]
+
+    service.process_message_for_test(
+        InboundMessage(
+            channel="telegram",
+            chat_id=1,
+            message_id=115,
+            user_id=200,
+            text="/reasoning list",
+            is_group=False,
+            command="reasoning",
+            command_args="list",
+        ),
+    )
+
+    assert telegram.sent == [
+        (
+            1,
+            "Reasoning levels for gpt-5.2-codex:\n- low\n- medium (default)\n- high",
+        )
+    ]
+
+
+def test_service_processes_reasoning_set_and_uses_it_for_future_turns(tmp_path: Path) -> None:
+    service = GatewayService(_config(tmp_path))
+    service._bridge = FakeBridge()  # type: ignore[attr-defined]
+    telegram = FakeTelegram()
+    runner = FakeRunner()
+    service._telegram = telegram  # type: ignore[attr-defined]
+    service._codex_runner = runner  # type: ignore[attr-defined]
+
+    service.process_message_for_test(
+        InboundMessage(
+            channel="telegram",
+            chat_id=1,
+            message_id=116,
+            user_id=200,
+            text="/reasoning high",
+            is_group=False,
+            command="reasoning",
+            command_args="high",
+        ),
+    )
+    service.process_message_for_test(
+        InboundMessage(
+            channel="telegram",
+            chat_id=1,
+            message_id=117,
+            user_id=200,
+            text="go",
+            is_group=False,
+        ),
+    )
+
+    assert telegram.sent[0] == (1, "Reasoning changed to high for gpt-5.2-codex")
+    assert runner.calls[-1] == (None, "go", "gpt-5.2-codex", "high")
+
+
+def test_service_rejects_unsupported_reasoning_for_model(tmp_path: Path) -> None:
+    service = GatewayService(_config(tmp_path))
+    service._bridge = FakeBridge()  # type: ignore[attr-defined]
+    telegram = FakeTelegram()
+    runner = FakeRunner()
+    service._telegram = telegram  # type: ignore[attr-defined]
+    service._codex_runner = runner  # type: ignore[attr-defined]
+
+    service.process_message_for_test(
+        InboundMessage(
+            channel="telegram",
+            chat_id=1,
+            message_id=118,
+            user_id=200,
+            text="/reasoning xhigh",
+            is_group=False,
+            command="reasoning",
+            command_args="xhigh",
+        ),
+    )
+
+    assert telegram.sent == [
+        (
+            1,
+            "Unsupported reasoning for gpt-5.2-codex: xhigh\nSupported: low, medium, high",
+        )
+    ]
+
+
+def test_service_can_reset_reasoning_to_model_default(tmp_path: Path) -> None:
+    service = GatewayService(_config(tmp_path))
+    service._bridge = FakeBridge()  # type: ignore[attr-defined]
+    telegram = FakeTelegram()
+    runner = FakeRunner()
+    service._telegram = telegram  # type: ignore[attr-defined]
+    service._codex_runner = runner  # type: ignore[attr-defined]
+
+    service.process_message_for_test(
+        InboundMessage(
+            channel="telegram",
+            chat_id=1,
+            message_id=119,
+            user_id=200,
+            text="/reasoning high",
+            is_group=False,
+            command="reasoning",
+            command_args="high",
+        ),
+    )
+    service.process_message_for_test(
+        InboundMessage(
+            channel="telegram",
+            chat_id=1,
+            message_id=120,
+            user_id=200,
+            text="/reasoning reset",
+            is_group=False,
+            command="reasoning",
+            command_args="reset",
+        ),
+    )
+    service.process_message_for_test(
+        InboundMessage(
+            channel="telegram",
+            chat_id=1,
+            message_id=121,
+            user_id=200,
+            text="go",
+            is_group=False,
+        ),
+    )
+
+    assert telegram.sent[1] == (1, "Reasoning reset to default: medium")
+    assert runner.calls[-1] == (None, "go", "gpt-5.2-codex", "medium")

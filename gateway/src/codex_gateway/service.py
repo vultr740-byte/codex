@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 import textwrap
 
-from .codex_runner import ApprovalNotAllowedError, CodexRunner
+from .codex_runner import ApprovalNotAllowedError, CodexModelInfo, CodexRunner
 from .config import GatewayConfig
 from .db import GatewayDb
 from .messages import InboundMessage
@@ -252,6 +252,7 @@ class GatewayService:
             try:
                 session = self._db.get_session(channel="telegram", external_chat_id=str(message.chat_id))
                 model = self._effective_model_for_chat(message.chat_id)
+                effort = self._effective_reasoning_for_chat(message.chat_id)
 
                 def on_delta(delta: str) -> None:
                     nonlocal delta_chars, delta_count, first_delta_at
@@ -273,6 +274,7 @@ class GatewayService:
                     prompt=message.text,
                     on_delta=on_delta,
                     model=model,
+                    effort=effort,
                 )
                 completed_at = time.monotonic()
                 logger.info(
@@ -351,12 +353,46 @@ class GatewayService:
             return preferences.model
         return self._config.codex_model
 
-    def _save_model_for_chat(self, chat_id: int, model: str | None) -> None:
+    def _effective_reasoning_for_chat(self, chat_id: int) -> str | None:
+        preferences = self._db.get_preferences(channel="telegram", external_chat_id=str(chat_id))
+        if preferences is not None and preferences.reasoning_effort:
+            return preferences.reasoning_effort
+        return None
+
+    def _save_preferences_for_chat(
+        self,
+        chat_id: int,
+        *,
+        model: str | None,
+        reasoning_effort: str | None,
+    ) -> None:
         self._db.save_preferences(
             channel="telegram",
             external_chat_id=str(chat_id),
             model=model,
+            reasoning_effort=reasoning_effort,
         )
+
+    def _current_preferences(self, chat_id: int) -> tuple[str, str | None]:
+        return (
+            self._effective_model_for_chat(chat_id),
+            self._effective_reasoning_for_chat(chat_id),
+        )
+
+    def _find_model_info(self, chat_id: int, model_id: str | None = None) -> tuple[CodexModelInfo | None, list[CodexModelInfo]]:
+        models = self._codex_runner.list_models()
+        target_id = model_id or self._effective_model_for_chat(chat_id)
+        target = next((model for model in models if model.id == target_id), None)
+        return target, models
+
+    def _normalize_effort(self, effort: str) -> str:
+        normalized = effort.strip().lower().replace("extra-high", "xhigh").replace("extra_high", "xhigh")
+        if normalized == "extra":
+            return "xhigh"
+        return normalized
+
+    def _format_reasoning(self, effort: str | None) -> str:
+        return effort or "default"
 
     def _process_command_message(self, message: InboundMessage) -> None:
         command = message.command or ""
@@ -459,6 +495,7 @@ class GatewayService:
                     f"preview: {info.preview or '(empty)'}",
                     f"cwd: {info.cwd}",
                     f"model: {effective_model}",
+                    f"reasoning_effort: {self._format_reasoning(self._effective_reasoning_for_chat(message.chat_id))}",
                     f"approval_policy: {self._config.codex_approval_policy}",
                     f"sandbox_mode: {self._config.codex_sandbox_mode}",
                 ]
@@ -466,46 +503,145 @@ class GatewayService:
                 return
 
             if command == "model":
+                current_model, current_effort = self._current_preferences(message.chat_id)
                 if not args or args in {"current", "show", "status"}:
                     lines = [
-                        f"Current model: {self._effective_model_for_chat(message.chat_id)}",
+                        f"Current model: {current_model}",
+                        f"Current reasoning: {self._format_reasoning(current_effort)}",
                         "",
                         "Usage:",
                         "/model list",
                         "/model <model-id>",
+                        "/model <model-id> <reasoning>",
                     ]
                     self._telegram.send_message(chat_id=message.chat_id, text="\n".join(lines))
                     return
 
-                models = self._codex_runner.list_models()
+                selected_model_info, models = self._find_model_info(message.chat_id)
                 if args == "list":
-                    current_model = self._effective_model_for_chat(message.chat_id)
                     lines = ["Available models:"]
                     for model in models[:40]:
-                        marker = " (current)" if model == current_model else ""
-                        lines.append(f"- {model}{marker}")
+                        marker = " (current)" if model.id == current_model else ""
+                        lines.append(
+                            f"- {model.id}{marker} [default: {model.default_reasoning_effort}; supported: {', '.join(model.supported_reasoning_efforts)}]"
+                        )
                     self._telegram.send_message(chat_id=message.chat_id, text="\n".join(lines))
                     return
 
                 if args == "reset":
-                    self._save_model_for_chat(message.chat_id, None)
+                    self._save_preferences_for_chat(
+                        message.chat_id,
+                        model=None,
+                        reasoning_effort=current_effort,
+                    )
                     self._telegram.send_message(
                         chat_id=message.chat_id,
                         text=f"Model reset to default: {self._config.codex_model}",
                     )
                     return
 
-                if args not in models:
+                parts = args.split()
+                selected_model = parts[0]
+                selected_effort = self._normalize_effort(parts[1]) if len(parts) > 1 else current_effort
+                model_info = next((model for model in models if model.id == selected_model), None)
+                if model_info is None:
                     self._telegram.send_message(
                         chat_id=message.chat_id,
-                        text=f"Unknown model: {args}\nUse /model list to see available models.",
+                        text=f"Unknown model: {selected_model}\nUse /model list to see available models.",
                     )
                     return
 
-                self._save_model_for_chat(message.chat_id, args)
+                if selected_effort is not None and selected_effort not in model_info.supported_reasoning_efforts:
+                    self._telegram.send_message(
+                        chat_id=message.chat_id,
+                        text=(
+                            f"Unsupported reasoning for {selected_model}: {selected_effort}\n"
+                            f"Supported: {', '.join(model_info.supported_reasoning_efforts)}"
+                        ),
+                    )
+                    return
+
+                effective_effort = selected_effort or model_info.default_reasoning_effort
+                self._save_preferences_for_chat(
+                    message.chat_id,
+                    model=selected_model,
+                    reasoning_effort=effective_effort,
+                )
                 self._telegram.send_message(
                     chat_id=message.chat_id,
-                    text=f"Model changed to {args}",
+                    text=f"Model changed to {selected_model} {effective_effort}",
+                )
+                return
+
+            if command == "reasoning":
+                model_info, models = self._find_model_info(message.chat_id)
+                current_model, current_effort = self._current_preferences(message.chat_id)
+                if model_info is None:
+                    self._telegram.send_message(
+                        chat_id=message.chat_id,
+                        text="Current model is not available in the model catalog. Use /model list first.",
+                    )
+                    return
+
+                if not args or args in {"current", "show", "status"}:
+                    lines = [
+                        f"Current reasoning: {self._format_reasoning(current_effort)}",
+                        f"Current model: {current_model}",
+                        f"Supported: {', '.join(model_info.supported_reasoning_efforts)}",
+                        f"Default for model: {model_info.default_reasoning_effort}",
+                        "",
+                        "Usage:",
+                        "/reasoning list",
+                        "/reasoning <level>",
+                        "/reasoning reset",
+                    ]
+                    self._telegram.send_message(chat_id=message.chat_id, text="\n".join(lines))
+                    return
+
+                if args == "list":
+                    self._telegram.send_message(
+                        chat_id=message.chat_id,
+                        text=(
+                            f"Reasoning levels for {current_model}:\n"
+                            + "\n".join(
+                                f"- {effort}{' (current)' if effort == current_effort else ''}{' (default)' if effort == model_info.default_reasoning_effort else ''}"
+                                for effort in model_info.supported_reasoning_efforts
+                            )
+                        ),
+                    )
+                    return
+
+                if args == "reset":
+                    self._save_preferences_for_chat(
+                        message.chat_id,
+                        model=current_model,
+                        reasoning_effort=model_info.default_reasoning_effort,
+                    )
+                    self._telegram.send_message(
+                        chat_id=message.chat_id,
+                        text=f"Reasoning reset to default: {model_info.default_reasoning_effort}",
+                    )
+                    return
+
+                selected_effort = self._normalize_effort(args)
+                if selected_effort not in model_info.supported_reasoning_efforts:
+                    self._telegram.send_message(
+                        chat_id=message.chat_id,
+                        text=(
+                            f"Unsupported reasoning for {current_model}: {selected_effort}\n"
+                            f"Supported: {', '.join(model_info.supported_reasoning_efforts)}"
+                        ),
+                    )
+                    return
+
+                self._save_preferences_for_chat(
+                    message.chat_id,
+                    model=current_model,
+                    reasoning_effort=selected_effort,
+                )
+                self._telegram.send_message(
+                    chat_id=message.chat_id,
+                    text=f"Reasoning changed to {selected_effort} for {current_model}",
                 )
                 return
 

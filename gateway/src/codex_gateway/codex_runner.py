@@ -9,6 +9,7 @@ from codex_app_server.generated.v2_all import (
     AgentMessageDeltaNotification,
     AskForApproval,
     ItemCompletedNotification,
+    ReasoningEffort,
     SandboxMode,
     TurnCompletedNotification,
 )
@@ -94,6 +95,13 @@ class CodexThreadInfo:
     model: str | None = None
 
 
+@dataclass(frozen=True)
+class CodexModelInfo:
+    id: str
+    default_reasoning_effort: str
+    supported_reasoning_efforts: list[str]
+
+
 class CodexRunner:
     def __init__(
         self,
@@ -115,8 +123,10 @@ class CodexRunner:
         prompt: str,
         on_delta: Callable[[str], None],
         model: str | None = None,
+        effort: str | None = None,
     ) -> CodexTurnResult:
         effective_model = model or self._model
+        effective_effort = ReasoningEffort(effort) if effort else None
         client = AppServerClient(
             config=self._app_server_config,
             approval_handler=_deny_approval,
@@ -156,6 +166,7 @@ class CodexRunner:
                     "approvalPolicy": self._approval_policy.root.value,
                     "cwd": self._app_server_config.cwd,
                     "model": effective_model,
+                    "effort": effective_effort.value if effective_effort else None,
                 },
             )
 
@@ -328,7 +339,7 @@ class CodexRunner:
         finally:
             client.close()
 
-    def list_models(self) -> list[str]:
+    def list_models(self) -> list[CodexModelInfo]:
         client = AppServerClient(
             config=self._app_server_config,
             approval_handler=_deny_approval,
@@ -337,6 +348,15 @@ class CodexRunner:
             client.start()
             client.initialize()
             models = client.model_list(include_hidden=False).data
-            return [model.id for model in models]
+            return [
+                CodexModelInfo(
+                    id=model.id,
+                    default_reasoning_effort=model.default_reasoning_effort.value,
+                    supported_reasoning_efforts=[
+                        option.reasoning_effort.value for option in model.supported_reasoning_efforts
+                    ],
+                )
+                for model in models
+            ]
         finally:
             client.close()

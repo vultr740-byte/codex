@@ -19,6 +19,7 @@ class ChatPreferences:
     channel: str
     external_chat_id: str
     model: str | None
+    reasoning_effort: str | None
 
 
 class GatewayDb:
@@ -62,12 +63,23 @@ class GatewayDb:
                     channel TEXT NOT NULL,
                     external_chat_id TEXT NOT NULL,
                     model TEXT,
+                    reasoning_effort TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     PRIMARY KEY (channel, external_chat_id)
                 )
                 """
             )
+            self._ensure_column("channel_preferences", "reasoning_effort", "TEXT")
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        existing_columns = {
+            row["name"]
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column in existing_columns:
+            return
+        self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def seen_message(self, *, channel: str, external_chat_id: str, external_message_id: str) -> bool:
         with self._lock, self._conn:
@@ -138,6 +150,7 @@ class GatewayDb:
             row = self._conn.execute(
                 """
                 SELECT channel, external_chat_id, model
+                    , reasoning_effort
                 FROM channel_preferences
                 WHERE channel = ? AND external_chat_id = ?
                 """,
@@ -149,9 +162,17 @@ class GatewayDb:
             channel=row["channel"],
             external_chat_id=row["external_chat_id"],
             model=row["model"],
+            reasoning_effort=row["reasoning_effort"],
         )
 
-    def save_preferences(self, *, channel: str, external_chat_id: str, model: str | None) -> None:
+    def save_preferences(
+        self,
+        *,
+        channel: str,
+        external_chat_id: str,
+        model: str | None,
+        reasoning_effort: str | None,
+    ) -> None:
         now = int(time.time())
         with self._lock, self._conn:
             self._conn.execute(
@@ -160,13 +181,15 @@ class GatewayDb:
                     channel,
                     external_chat_id,
                     model,
+                    reasoning_effort,
                     created_at,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(channel, external_chat_id)
                 DO UPDATE SET
                     model = excluded.model,
+                    reasoning_effort = excluded.reasoning_effort,
                     updated_at = excluded.updated_at
                 """,
-                (channel, external_chat_id, model, now, now),
+                (channel, external_chat_id, model, reasoning_effort, now, now),
             )
