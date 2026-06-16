@@ -69,6 +69,7 @@ coverage/
 
 # personal files
 personal/
+.local/
 
 # os
 .DS_Store
