@@ -137,6 +137,157 @@ test("bridge sends and cancels Weixin typing while a Codex turn is running", asy
   assert.equal(sentMessage?.item_list?.[0]?.text_item?.text, "hi");
 });
 
+test("bridge refreshes a stale Codex thread binding when the app-server no longer has the thread", async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-bridge-"));
+  fs.writeFileSync(
+    path.join(stateDir, "thread-bindings.json"),
+    JSON.stringify({
+      bindings: [
+        {
+          weixinUserId: "user-1",
+          codexThreadId: "old-thread",
+          updatedAt: 1,
+        },
+      ],
+    }),
+    "utf8",
+  );
+  const receivedWeixinRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];
+  let getUpdatesCount = 0;
+
+  const weixinServer = http.createServer((req, res) => {
+    const endpoint = new URL(req.url ?? "/", "http://localhost").pathname.replace(/^\/+/, "");
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk.toString("utf8");
+    });
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) as Record<string, unknown> : {};
+      receivedWeixinRequests.push({ endpoint, body });
+      res.setHeader("content-type", "application/json");
+
+      if (endpoint === "ilink/bot/getupdates") {
+        getUpdatesCount += 1;
+        if (getUpdatesCount === 1) {
+          res.end(JSON.stringify({
+            ret: 0,
+            get_updates_buf: "buf-1",
+            msgs: [
+              {
+                message_id: "msg-1",
+                from_user_id: "user-1",
+                context_token: "ctx-1",
+                item_list: [{ type: 1, text_item: { text: "hello" } }],
+              },
+            ],
+          }));
+          return;
+        }
+        res.end(JSON.stringify({ ret: 0, get_updates_buf: "buf-1", msgs: [] }));
+        return;
+      }
+
+      if (endpoint === "ilink/bot/getconfig") {
+        res.end(JSON.stringify({ ret: 0, typing_ticket: "ticket-1" }));
+        return;
+      }
+
+      res.end(JSON.stringify({ ret: 0 }));
+    });
+  });
+
+  const turnStartThreadIds: string[] = [];
+  const weixinBaseUrl = await listen(weixinServer);
+  const appServer = new WebSocketServer({ port: 0 });
+  await new Promise<void>((resolve) => {
+    appServer.once("listening", resolve);
+  });
+  appServer.on("connection", (ws) => {
+    ws.on("message", (data) => {
+      const message = JSON.parse(data.toString()) as {
+        id?: number;
+        method?: string;
+        params?: { threadId?: string };
+      };
+
+      if (message.id !== undefined && message.method === "initialize") {
+        ws.send(JSON.stringify({ id: message.id, result: {} }));
+        return;
+      }
+      if (message.id !== undefined && message.method === "thread/start") {
+        ws.send(JSON.stringify({ id: message.id, result: { thread: { id: "new-thread" } } }));
+        return;
+      }
+      if (message.id !== undefined && message.method === "turn/start") {
+        turnStartThreadIds.push(message.params?.threadId ?? "");
+        if (message.params?.threadId === "old-thread") {
+          ws.send(JSON.stringify({
+            id: message.id,
+            error: { code: -32600, message: "thread not found: old-thread" },
+          }));
+          return;
+        }
+        ws.send(JSON.stringify({ id: message.id, result: { turn: { id: "turn-1" } } }));
+        setTimeout(() => {
+          ws.send(JSON.stringify({
+            method: "item/agentMessage/delta",
+            params: { turnId: "turn-1", delta: "fresh reply" },
+          }));
+          ws.send(JSON.stringify({
+            method: "turn/completed",
+            params: { turn: { id: "turn-1", status: "completed" } },
+          }));
+        }, 50);
+      }
+    });
+  });
+
+  const appServerAddress = appServer.address();
+  assert.ok(appServerAddress && typeof appServerAddress !== "string");
+  const appServerUrl = `ws://127.0.0.1:${appServerAddress.port}`;
+  const bridge = new Bridge({
+    appServerUrl,
+    appServerToken: "codex-token",
+    weixinBaseUrl,
+    weixinToken: "weixin-token",
+    controlApiToken: null,
+    stateDir,
+    codexThreadMode: "per_user",
+    defaultCwd: null,
+  });
+
+  const bridgeTask = bridge.start();
+
+  try {
+    await waitFor(() =>
+      receivedWeixinRequests.some((request) => request.endpoint === "ilink/bot/sendmessage")
+    );
+  } finally {
+    await bridge.stop();
+    appServer.close();
+    weixinServer.close();
+    await bridgeTask;
+  }
+
+  assert.deepEqual(turnStartThreadIds, ["old-thread", "new-thread"]);
+
+  const sendMessageRequests = receivedWeixinRequests.filter((request) => request.endpoint === "ilink/bot/sendmessage");
+  assert.equal(sendMessageRequests.length, 1);
+  const sentMessage = sendMessageRequests[0]?.body.msg as { to_user_id?: string; item_list?: Array<{ text_item?: { text?: string } }> } | undefined;
+  const sentText = sentMessage?.item_list?.[0]?.text_item?.text ?? "";
+  assert.equal(sentMessage?.to_user_id, "user-1");
+  assert.equal(sentText, "fresh reply");
+  assert.doesNotMatch(sentText, /thread not found/);
+
+  const bindingFile = JSON.parse(fs.readFileSync(path.join(stateDir, "thread-bindings.json"), "utf8")) as {
+    bindings: Array<{ weixinUserId: string; codexThreadId: string; updatedAt: number }>;
+  };
+  assert.equal(bindingFile.bindings.length, 1);
+  assert.equal(bindingFile.bindings[0]?.weixinUserId, "user-1");
+  assert.equal(bindingFile.bindings[0]?.codexThreadId, "new-thread");
+  assert.ok(bindingFile.bindings[0]?.updatedAt > 1);
+});
+
 test("bridge sends a billing failure message when a Codex turn fails with payment error", async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-bridge-"));
   const receivedWeixinRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];

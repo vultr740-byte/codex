@@ -89,13 +89,9 @@ export class Bridge {
           });
 
           const binding = this.threadBindings.getByWeixinUserId(fromUserId);
-          const threadId = binding?.codexThreadId ?? (await this.codex.startThread());
+          let threadId = binding?.codexThreadId ?? (await this.codex.startThread());
           if (!binding) {
-            this.threadBindings.save({
-              weixinUserId: fromUserId,
-              codexThreadId: threadId,
-              updatedAt: Date.now(),
-            });
+            this.saveThreadBinding(fromUserId, threadId);
           }
 
           const typing = this.startTypingIndicator({
@@ -105,6 +101,7 @@ export class Bridge {
             typingTicket,
           });
           let result: { assistantText: string } | null = null;
+          let failure: unknown | null = null;
           try {
             result = await this.codex.sendTurn({
               threadId,
@@ -112,16 +109,35 @@ export class Bridge {
               clientUserMessageId: messageId,
             });
           } catch (error) {
-            console.error(error);
+            if (isThreadNotFound(error)) {
+              console.warn(`Codex thread ${threadId} was not found; starting a fresh thread for ${fromUserId}.`);
+              try {
+                threadId = await this.codex.startThread();
+                this.saveThreadBinding(fromUserId, threadId);
+                result = await this.codex.sendTurn({
+                  threadId,
+                  text,
+                  clientUserMessageId: messageId,
+                });
+              } catch (retryError) {
+                failure = retryError;
+              }
+            } else {
+              failure = error;
+            }
+          } finally {
+            await typing.stop();
+          }
+
+          if (failure) {
+            console.error(failure);
             await sendTextMessage({
               baseUrl,
               token,
               toUserId: fromUserId,
-              text: formatCodexFailureMessage(error),
+              text: formatCodexFailureMessage(failure),
               contextToken: msg.context_token ?? null,
             });
-          } finally {
-            await typing.stop();
           }
 
           this.threadBindings.updateWeixinUserId(fromUserId, { updatedAt: Date.now() });
@@ -150,6 +166,14 @@ export class Bridge {
   async stop(): Promise<void> {
     this.running = false;
     await this.codex.close();
+  }
+
+  private saveThreadBinding(weixinUserId: string, codexThreadId: string): void {
+    this.threadBindings.save({
+      weixinUserId,
+      codexThreadId,
+      updatedAt: Date.now(),
+    });
   }
 
   private async getTypingTicket(params: {
@@ -290,6 +314,11 @@ function isBillingFailure(message: string): boolean {
     normalized.includes("billing") ||
     normalized.includes("quota")
   );
+}
+
+function isThreadNotFound(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.toLowerCase().includes("thread not found");
 }
 
 function resolveRechargeUrl(): string | null {
