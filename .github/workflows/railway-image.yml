@@ -8,8 +8,12 @@ on:
       - .github/workflows/railway-image.yml
       - .dockerignore
       - Dockerfile
+      - codex-weixin-bridge/**
       - railway.toml
+      - scripts/app-server-run.sh
       - scripts/app-server-start.sh
+      - scripts/app-server-with-weixin-start.sh
+      - scripts/codex-app-server-common.sh
   workflow_dispatch:
 
 permissions:
