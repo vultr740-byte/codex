@@ -32,6 +32,17 @@ export async function getUpdates(params: WeixinApiOptions & {
   }
 }
 
+export async function getConfig(params: WeixinApiOptions & {
+  ilinkUserId: string;
+  contextToken?: string | null;
+}): Promise<{ ret?: number; errmsg?: string; typing_ticket?: string }> {
+  const response = await postJson(params, "ilink/bot/getconfig", {
+    ilink_user_id: params.ilinkUserId,
+    ...(params.contextToken ? { context_token: params.contextToken } : {}),
+  });
+  return response as { ret?: number; errmsg?: string; typing_ticket?: string };
+}
+
 export async function sendTextMessage(params: WeixinApiOptions & {
   toUserId: string;
   text: string;
@@ -55,6 +66,18 @@ export async function sendTextMessage(params: WeixinApiOptions & {
       ...(params.contextToken ? { context_token: params.contextToken } : {}),
     },
     base_info: buildBaseInfo(),
+  });
+}
+
+export async function sendTyping(params: WeixinApiOptions & {
+  toUserId: string;
+  typingTicket: string;
+  status: 1 | 2;
+}): Promise<void> {
+  await postJson(params, "ilink/bot/sendtyping", {
+    ilink_user_id: params.toUserId,
+    typing_ticket: params.typingTicket,
+    status: params.status,
   });
 }
 

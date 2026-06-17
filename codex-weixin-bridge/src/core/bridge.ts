@@ -1,5 +1,5 @@
 import { CodexAppServerClient } from "../providers/codex/app-server-client.js";
-import { getUpdates, sendTextMessage } from "../platforms/weixin/api.js";
+import { getConfig, getUpdates, sendTextMessage, sendTyping } from "../platforms/weixin/api.js";
 import type { BridgeConfig } from "../types.js";
 import { DedupStore } from "../store/dedup-store.js";
 import { ThreadBindingStore } from "../store/thread-binding-store.js";
@@ -8,6 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 const SESSION_EXPIRED_ERRCODE = -14;
+const TYPING_KEEPALIVE_INTERVAL_MS = 5_000;
 
 export class Bridge {
   private readonly config: BridgeConfig;
@@ -15,6 +16,7 @@ export class Bridge {
   private readonly threadBindings: ThreadBindingStore;
   private readonly dedup: DedupStore;
   private readonly accountStore: WeixinAccountStore;
+  private readonly typingTickets = new TypingTicketCache();
   private readonly syncBufPath: string;
   private running = false;
 
@@ -77,6 +79,13 @@ export class Bridge {
             continue;
           }
 
+          const typingTicket = await this.getTypingTicket({
+            baseUrl,
+            token,
+            userId: fromUserId,
+            contextToken: msg.context_token ?? null,
+          });
+
           const binding = this.threadBindings.getByWeixinUserId(fromUserId);
           const threadId = binding?.codexThreadId ?? (await this.codex.startThread());
           if (!binding) {
@@ -87,11 +96,22 @@ export class Bridge {
             });
           }
 
-          const result = await this.codex.sendTurn({
-            threadId,
-            text,
-            clientUserMessageId: messageId,
+          const typing = this.startTypingIndicator({
+            baseUrl,
+            token,
+            toUserId: fromUserId,
+            typingTicket,
           });
+          let result: { assistantText: string };
+          try {
+            result = await this.codex.sendTurn({
+              threadId,
+              text,
+              clientUserMessageId: messageId,
+            });
+          } finally {
+            await typing.stop();
+          }
 
           this.threadBindings.updateWeixinUserId(fromUserId, { updatedAt: Date.now() });
 
@@ -119,6 +139,86 @@ export class Bridge {
   async stop(): Promise<void> {
     this.running = false;
     await this.codex.close();
+  }
+
+  private async getTypingTicket(params: {
+    baseUrl: string;
+    token: string;
+    userId: string;
+    contextToken: string | null;
+  }): Promise<string | null> {
+    const cached = this.typingTickets.get(params.userId);
+    if (cached) {
+      return cached;
+    }
+
+    try {
+      const config = await getConfig({
+        baseUrl: params.baseUrl,
+        token: params.token,
+        ilinkUserId: params.userId,
+        contextToken: params.contextToken,
+      });
+      const ticket = config.typing_ticket?.trim();
+      if (ticket) {
+        this.typingTickets.set(params.userId, ticket);
+        return ticket;
+      }
+    } catch (error) {
+      console.error(`Weixin getconfig failed for ${params.userId}:`, error);
+    }
+
+    return null;
+  }
+
+  private startTypingIndicator(params: {
+    baseUrl: string;
+    token: string;
+    toUserId: string;
+    typingTicket: string | null;
+  }): { stop: () => Promise<void> } {
+    if (!params.typingTicket) {
+      return { stop: async () => {} };
+    }
+
+    let stopped = false;
+    let sendQueue = Promise.resolve();
+    const send = async (status: 1 | 2) => {
+      try {
+        await sendTyping({
+          baseUrl: params.baseUrl,
+          token: params.token,
+          toUserId: params.toUserId,
+          typingTicket: params.typingTicket!,
+          status,
+        });
+      } catch (error) {
+        console.error(`Weixin sendtyping failed for ${params.toUserId}:`, error);
+      }
+    };
+
+    const enqueue = (status: 1 | 2) => {
+      sendQueue = sendQueue.then(() => send(status));
+      return sendQueue;
+    };
+
+    void enqueue(1);
+    const interval = setInterval(() => {
+      if (!stopped) {
+        void enqueue(1);
+      }
+    }, TYPING_KEEPALIVE_INTERVAL_MS);
+
+    return {
+      stop: async () => {
+        if (stopped) {
+          return;
+        }
+        stopped = true;
+        clearInterval(interval);
+        await enqueue(2);
+      },
+    };
   }
 
   private loadSyncBuf(): string {
@@ -161,4 +261,16 @@ function isApiError(resp: { ret?: number; errcode?: number }): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+class TypingTicketCache {
+  private readonly tickets = new Map<string, string>();
+
+  get(userId: string): string | null {
+    return this.tickets.get(userId) ?? null;
+  }
+
+  set(userId: string, ticket: string): void {
+    this.tickets.set(userId, ticket);
+  }
 }

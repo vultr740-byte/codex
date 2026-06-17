@@ -13,6 +13,7 @@ inside the same container.
 - Keep one Codex thread per Weixin user
 - Send user text to Codex app-server
 - Send Codex replies back to Weixin
+- Send best-effort Weixin typing indicators while Codex is processing
 - Expose a small control API for QR login
 - Proxy WebSocket clients to the configured Codex app-server URL
 
@@ -82,5 +83,8 @@ If `CONTROL_API_TOKEN` is set, send `Authorization: Bearer <token>` to the contr
 ## Notes
 
 - The bridge is text-first in this version.
+- Typing indicators are best-effort. If the Weixin account exposes a typing
+  ticket, the bridge sends `sendtyping` while a Codex turn is running and
+  cancels it when the turn completes.
 - WebSocket conversation still happens through the Codex app-server. The bridge
   only proxies the external WebSocket connection when used as the public entrypoint.
