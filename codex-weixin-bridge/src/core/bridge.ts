@@ -9,6 +9,8 @@ import path from "node:path";
 
 const SESSION_EXPIRED_ERRCODE = -14;
 const TYPING_KEEPALIVE_INTERVAL_MS = 5_000;
+const DEFAULT_RECHARGE_BASE_URL = "https://www.xialiao.app/recharge/";
+const BILLING_ERROR_MESSAGE = "⚠️ 模型余额不足，请充值后重试。";
 
 export class Bridge {
   private readonly config: BridgeConfig;
@@ -102,12 +104,21 @@ export class Bridge {
             toUserId: fromUserId,
             typingTicket,
           });
-          let result: { assistantText: string };
+          let result: { assistantText: string } | null = null;
           try {
             result = await this.codex.sendTurn({
               threadId,
               text,
               clientUserMessageId: messageId,
+            });
+          } catch (error) {
+            console.error(error);
+            await sendTextMessage({
+              baseUrl,
+              token,
+              toUserId: fromUserId,
+              text: formatCodexFailureMessage(error),
+              contextToken: msg.context_token ?? null,
             });
           } finally {
             await typing.stop();
@@ -115,7 +126,7 @@ export class Bridge {
 
           this.threadBindings.updateWeixinUserId(fromUserId, { updatedAt: Date.now() });
 
-          if (result.assistantText) {
+          if (result?.assistantText) {
             await sendTextMessage({
               baseUrl,
               token,
@@ -257,6 +268,38 @@ function extractText(items: Array<{ type?: number; text_item?: { text?: string }
 
 function isApiError(resp: { ret?: number; errcode?: number }): boolean {
   return (resp.ret !== undefined && resp.ret !== 0) || (resp.errcode !== undefined && resp.errcode !== 0);
+}
+
+function formatCodexFailureMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (isBillingFailure(message)) {
+    const rechargeUrl = resolveRechargeUrl();
+    return rechargeUrl ? `${BILLING_ERROR_MESSAGE}\n${rechargeUrl}` : BILLING_ERROR_MESSAGE;
+  }
+  return `⚠️ Codex 对话失败：${message.slice(0, 500)}`;
+}
+
+function isBillingFailure(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("402") ||
+    normalized.includes("payment required") ||
+    normalized.includes("insufficient balance") ||
+    normalized.includes("insufficient funds") ||
+    normalized.includes("credits") ||
+    normalized.includes("billing") ||
+    normalized.includes("quota")
+  );
+}
+
+function resolveRechargeUrl(): string | null {
+  const target = process.env.RECHARGE_TARGET?.trim();
+  if (!target) {
+    return null;
+  }
+  const baseUrl = process.env.RECHARGE_BASE_URL?.trim() || DEFAULT_RECHARGE_BASE_URL;
+  const normalizedBaseUrl = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  return `${normalizedBaseUrl}${encodeURIComponent(target)}`;
 }
 
 function sleep(ms: number): Promise<void> {
