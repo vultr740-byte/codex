@@ -4,3 +4,12 @@
 !railway.toml
 !scripts/
 !scripts/app-server-start.sh
+!scripts/app-server-run.sh
+!scripts/app-server-with-weixin-start.sh
+!scripts/codex-app-server-common.sh
+!codex-weixin-bridge/
+!codex-weixin-bridge/package.json
+!codex-weixin-bridge/package-lock.json
+!codex-weixin-bridge/tsconfig.json
+!codex-weixin-bridge/src/
+!codex-weixin-bridge/src/**
