@@ -1,5 +1,7 @@
 import { createCipheriv, createDecipheriv } from "node:crypto";
 
+const UPLOAD_MAX_RETRIES = 3;
+
 function buildCdnDownloadUrl(encryptedQueryParam: string, cdnBaseUrl: string): string {
   return `${ensureTrailingSlash(cdnBaseUrl)}download?encrypted_query_param=${encodeURIComponent(encryptedQueryParam)}`;
 }
@@ -92,18 +94,42 @@ export async function uploadBufferToCdn(params: {
   }
 
   const ciphertext = encryptAesEcb(params.buffer, params.aeskey);
-  const response = await fetch(uploadUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/octet-stream" },
-    body: new Uint8Array(ciphertext),
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "(unreadable)");
-    throw new Error(`CDN upload ${response.status} ${response.statusText}: ${body.slice(0, 500)}`);
+  let downloadEncryptedQueryParam: string | undefined;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= UPLOAD_MAX_RETRIES; attempt += 1) {
+    try {
+      const response = await fetch(uploadUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: new Uint8Array(ciphertext),
+      });
+      if (response.status >= 400 && response.status < 500) {
+        const body = response.headers.get("x-error-message") ?? await response.text().catch(() => "(unreadable)");
+        throw new Error(`CDN upload client error ${response.status}: ${body.slice(0, 500)}`);
+      }
+      if (response.status !== 200) {
+        const body = response.headers.get("x-error-message") ?? await response.text().catch(() => response.statusText || "(unreadable)");
+        throw new Error(`CDN upload server error ${response.status}: ${body.slice(0, 500)}`);
+      }
+      downloadEncryptedQueryParam = response.headers.get("x-encrypted-param")?.trim();
+      if (!downloadEncryptedQueryParam) {
+        throw new Error("CDN upload response missing x-encrypted-param header.");
+      }
+      break;
+    } catch (error) {
+      lastError = error;
+      if (error instanceof Error && error.message.includes("client error")) {
+        throw error;
+      }
+      if (attempt === UPLOAD_MAX_RETRIES) {
+        break;
+      }
+    }
   }
-  const downloadEncryptedQueryParam = response.headers.get("x-encrypted-param")?.trim();
+
   if (!downloadEncryptedQueryParam) {
-    throw new Error("CDN upload response missing x-encrypted-param header.");
+    throw lastError instanceof Error ? lastError : new Error(`CDN upload failed after ${UPLOAD_MAX_RETRIES} attempts.`);
   }
   return { downloadEncryptedQueryParam };
 }

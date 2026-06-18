@@ -472,6 +472,7 @@ test("bridge sends Codex-declared output files as native Weixin attachments", as
   fs.writeFileSync(outputFile, "zip bytes", "utf8");
   const receivedWeixinRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];
   const uploadedCdnBodies: Buffer[] = [];
+  let cdnUploadAttempts = 0;
   let getUpdatesCount = 0;
   let sawDeveloperInstructions = false;
 
@@ -483,7 +484,13 @@ test("bridge sends Codex-declared output files as native Weixin attachments", as
         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       });
       req.on("end", () => {
+        cdnUploadAttempts += 1;
         uploadedCdnBodies.push(Buffer.concat(chunks));
+        if (cdnUploadAttempts === 1) {
+          res.writeHead(500);
+          res.end("temporary cdn error");
+          return;
+        }
         res.setHeader("x-encrypted-param", "uploaded-param");
         res.end("ok");
       });
@@ -610,7 +617,7 @@ test("bridge sends Codex-declared output files as native Weixin attachments", as
 
   try {
     await waitFor(() =>
-      receivedWeixinRequests.filter((request) => request.endpoint === "ilink/bot/sendmessage").length >= 2
+      receivedWeixinRequests.filter((request) => request.endpoint === "ilink/bot/sendmessage").length >= 3
     );
   } finally {
     await bridge.stop();
@@ -621,14 +628,19 @@ test("bridge sends Codex-declared output files as native Weixin attachments", as
   }
 
   assert.equal(sawDeveloperInstructions, true);
-  assert.equal(uploadedCdnBodies.length, 1);
+  assert.equal(uploadedCdnBodies.length, 2);
 
   const sendMessages = receivedWeixinRequests.filter((request) => request.endpoint === "ilink/bot/sendmessage");
   const textMessage = sendMessages[0]?.body.msg as { item_list?: Array<{ text_item?: { text?: string } }> } | undefined;
+  assert.equal(textMessage?.item_list?.length, 1);
   assert.equal(textMessage?.item_list?.[0]?.text_item?.text, "Here is the zip.");
   assert.doesNotMatch(textMessage?.item_list?.[0]?.text_item?.text ?? "", /codex-weixin-attachments/);
 
-  const fileMessage = sendMessages[1]?.body.msg as {
+  const captionMessage = sendMessages[1]?.body.msg as { item_list?: Array<{ text_item?: { text?: string } }> } | undefined;
+  assert.equal(captionMessage?.item_list?.length, 1);
+  assert.equal(captionMessage?.item_list?.[0]?.text_item?.text, "zip file");
+
+  const fileMessage = sendMessages[2]?.body.msg as {
     item_list?: Array<{
       text_item?: { text?: string };
       file_item?: {
@@ -638,11 +650,11 @@ test("bridge sends Codex-declared output files as native Weixin attachments", as
       };
     }>;
   } | undefined;
-  assert.equal(fileMessage?.item_list?.[0]?.text_item?.text, "zip file");
-  assert.equal(fileMessage?.item_list?.[1]?.file_item?.file_name, "answer.zip");
-  assert.equal(fileMessage?.item_list?.[1]?.file_item?.len, String(Buffer.byteLength("zip bytes")));
-  assert.equal(fileMessage?.item_list?.[1]?.file_item?.media?.encrypt_query_param, "uploaded-param");
-  assert.ok(fileMessage?.item_list?.[1]?.file_item?.media?.aes_key);
+  assert.equal(fileMessage?.item_list?.length, 1);
+  assert.equal(fileMessage?.item_list?.[0]?.file_item?.file_name, "answer.zip");
+  assert.equal(fileMessage?.item_list?.[0]?.file_item?.len, String(Buffer.byteLength("zip bytes")));
+  assert.equal(fileMessage?.item_list?.[0]?.file_item?.media?.encrypt_query_param, "uploaded-param");
+  assert.ok(fileMessage?.item_list?.[0]?.file_item?.media?.aes_key);
 });
 
 test("bridge sends a billing failure message when a Codex turn fails with payment error", async () => {

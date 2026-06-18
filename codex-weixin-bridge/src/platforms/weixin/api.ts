@@ -313,18 +313,21 @@ async function sendMediaMessage(
     itemList.push({ type: 1, text_item: { text: params.text } });
   }
   itemList.push(media.item);
-  await postJson(params, "ilink/bot/sendmessage", {
-    msg: {
-      from_user_id: "",
-      to_user_id: params.toUserId,
-      client_id: `codex-weixin-${crypto.randomUUID()}`,
-      message_type: 2,
-      message_state: 2,
-      item_list: itemList,
-      ...(params.contextToken ? { context_token: params.contextToken } : {}),
-    },
-    base_info: buildBaseInfo(),
-  });
+
+  for (const item of itemList) {
+    await postJson(params, "ilink/bot/sendmessage", {
+      msg: {
+        from_user_id: "",
+        to_user_id: params.toUserId,
+        client_id: `codex-weixin-${crypto.randomUUID()}`,
+        message_type: 2,
+        message_state: 2,
+        item_list: [item],
+        ...(params.contextToken ? { context_token: params.contextToken } : {}),
+      },
+      base_info: buildBaseInfo(),
+    });
+  }
 }
 
 function ensureTrailingSlash(value: string): string {
