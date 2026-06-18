@@ -22,9 +22,6 @@ export async function prepareImageUploadInput(filePath: string): Promise<{
 }> {
   const originalStat = await fs.stat(filePath);
   if (!hasMediaTools()) {
-    if (originalStat.size > MAX_WEIXIN_IMAGE_BYTES) {
-      throw new Error(`image exceeds Weixin upload limit and ffmpeg/ffprobe are unavailable: ${filePath}`);
-    }
     console.warn(JSON.stringify({
       event: "weixin_image_prepare_fallback_original",
       filePath,
@@ -43,9 +40,6 @@ export async function prepareImageUploadInput(filePath: string): Promise<{
 
   const transcoded = await transcodeStillImageJpeg(filePath);
   if (!transcoded) {
-    if (originalStat.size > MAX_WEIXIN_IMAGE_BYTES) {
-      throw new Error(`failed to transcode image for Weixin upload: ${filePath}`);
-    }
     console.warn(JSON.stringify({
       event: "weixin_image_prepare_fallback_original",
       filePath,
@@ -80,7 +74,21 @@ export async function prepareImageUploadInput(filePath: string): Promise<{
       targetBytes: TARGET_WEIXIN_IMAGE_BYTES,
     });
     if (!normalized) {
-      throw new Error(`failed to normalize image for Weixin upload: ${filePath}`);
+      await transcoded.cleanup().catch(() => {});
+      console.warn(JSON.stringify({
+        event: "weixin_image_prepare_fallback_original",
+        filePath,
+        reason: "normalize_failed",
+        originalSizeBytes: originalStat.size,
+      }));
+      return {
+        filePath,
+        originalSizeBytes: originalStat.size,
+        uploadSizeBytes: originalStat.size,
+        transcodedToJpeg: false,
+        normalized: false,
+        cleanup: null,
+      };
     }
 
     const normalizedStat = await fs.stat(normalized.filePath);
@@ -97,7 +105,21 @@ export async function prepareImageUploadInput(filePath: string): Promise<{
     };
   } catch (error) {
     await transcoded.cleanup().catch(() => {});
-    throw error;
+    console.warn(JSON.stringify({
+      event: "weixin_image_prepare_fallback_original",
+      filePath,
+      reason: "normalize_error",
+      originalSizeBytes: originalStat.size,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+    return {
+      filePath,
+      originalSizeBytes: originalStat.size,
+      uploadSizeBytes: originalStat.size,
+      transcodedToJpeg: false,
+      normalized: false,
+      cleanup: null,
+    };
   }
 }
 

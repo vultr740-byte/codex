@@ -828,12 +828,33 @@ test("bridge normalizes Codex-declared images before Weixin CDN upload", async (
   assert.ok(Number(uploadRequest.body.rawsize) < originalSize);
 });
 
-test("bridge reports oversized image attachments when media tools are unavailable", async () => {
+test("bridge uploads original image attachments when media tools are unavailable", async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-bridge-"));
   const imageFile = path.join(stateDir, "large.bmp");
   fs.writeFileSync(imageFile, makeBmpImage(1_024, 1_024));
+  const originalSize = fs.statSync(imageFile).size;
   const receivedWeixinRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];
+  const uploadedCdnBodies: Buffer[] = [];
   let getUpdatesCount = 0;
+
+  const cdnServer = http.createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    if (req.method === "POST" && url.pathname === "/upload") {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      req.on("end", () => {
+        uploadedCdnBodies.push(Buffer.concat(chunks));
+        res.setHeader("x-encrypted-param", "image-param");
+        res.end("ok");
+      });
+      return;
+    }
+    res.writeHead(404);
+    res.end("not found");
+  });
+  const cdnBaseUrl = await listen(cdnServer);
 
   const weixinServer = http.createServer((req, res) => {
     const endpoint = new URL(req.url ?? "/", "http://localhost").pathname.replace(/^\/+/, "");
@@ -869,6 +890,14 @@ test("bridge reports oversized image attachments when media tools are unavailabl
 
       if (endpoint === "ilink/bot/getconfig") {
         res.end(JSON.stringify({ ret: 0, typing_ticket: "ticket-1" }));
+        return;
+      }
+
+      if (endpoint === "ilink/bot/getuploadurl") {
+        res.end(JSON.stringify({
+          ret: 0,
+          upload_param: "upload-param",
+        }));
         return;
       }
 
@@ -931,7 +960,7 @@ test("bridge reports oversized image attachments when media tools are unavailabl
     appServerUrl,
     appServerToken: "codex-token",
     weixinBaseUrl,
-    weixinCdnBaseUrl: weixinBaseUrl,
+    weixinCdnBaseUrl: cdnBaseUrl,
     weixinToken: "weixin-token",
     controlApiToken: null,
     stateDir,
@@ -945,8 +974,8 @@ test("bridge reports oversized image attachments when media tools are unavailabl
   try {
     await waitFor(() =>
       receivedWeixinRequests.some((request) => request.endpoint === "ilink/bot/sendmessage" &&
-        /附件发送失败/u.test(((request.body.msg as { item_list?: Array<{ text_item?: { text?: string } }> } | undefined)
-          ?.item_list?.[0]?.text_item?.text) ?? ""))
+        ((request.body.msg as { item_list?: Array<{ image_item?: unknown }> } | undefined)
+          ?.item_list?.some((item) => item.image_item)))
     );
   } finally {
     if (previousFfmpegPath === undefined) {
@@ -962,16 +991,19 @@ test("bridge reports oversized image attachments when media tools are unavailabl
     await bridge.stop();
     appServer.close();
     weixinServer.close();
+    cdnServer.close();
     await bridgeTask;
   }
 
-  assert.equal(receivedWeixinRequests.some((request) => request.endpoint === "ilink/bot/getuploadurl"), false);
-  const failureMessage = receivedWeixinRequests
-    .filter((request) => request.endpoint === "ilink/bot/sendmessage")
-    .map((request) => (request.body.msg as { item_list?: Array<{ text_item?: { text?: string } }> } | undefined)
-      ?.item_list?.[0]?.text_item?.text ?? "")
-    .find((text) => /附件发送失败/u.test(text)) ?? "";
-  assert.match(failureMessage, /ffmpeg\/ffprobe are unavailable/u);
+  assert.equal(uploadedCdnBodies.length, 1);
+  assert.ok(uploadedCdnBodies[0].length > originalSize);
+
+  const uploadRequest = receivedWeixinRequests.find((request) => request.endpoint === "ilink/bot/getuploadurl");
+  assert.ok(uploadRequest);
+  assert.equal(uploadRequest.body.rawsize, originalSize);
+  assert.equal(receivedWeixinRequests.some((request) => request.endpoint === "ilink/bot/sendmessage" &&
+    /附件发送失败/u.test(((request.body.msg as { item_list?: Array<{ text_item?: { text?: string } }> } | undefined)
+      ?.item_list?.[0]?.text_item?.text) ?? "")), false);
 });
 
 test("bridge falls back from upload_full_url to upload_param when Weixin CDN rejects the full URL", async () => {
