@@ -13,6 +13,7 @@ import path from "node:path";
 
 const SESSION_EXPIRED_ERRCODE = -14;
 const TYPING_KEEPALIVE_INTERVAL_MS = 5_000;
+const OUTBOUND_ATTACHMENT_GAP_MS = 3_000;
 const DEFAULT_RECHARGE_BASE_URL = "https://www.xialiao.app/recharge/";
 const BILLING_ERROR_MESSAGE = "⚠️ 模型余额不足，请充值后重试。";
 
@@ -169,8 +170,14 @@ export class Bridge {
               });
             }
             const outboundErrors = [...outbound.errors];
-            for (const attachment of outbound.attachments) {
+            for (const [index, attachment] of outbound.attachments.entries()) {
               try {
+                console.log(JSON.stringify({
+                  event: "weixin_outbound_attachment_send_start",
+                  index,
+                  filePath: attachment.path,
+                  captionPresent: Boolean(attachment.caption?.trim()),
+                }));
                 await sendWeixinMediaFile({
                   filePath: attachment.path,
                   toUserId: fromUserId,
@@ -182,8 +189,23 @@ export class Bridge {
                   },
                   cdnBaseUrl: this.config.weixinCdnBaseUrl,
                 });
+                console.log(JSON.stringify({
+                  event: "weixin_outbound_attachment_send_complete",
+                  index,
+                  filePath: attachment.path,
+                }));
               } catch (error) {
-                outboundErrors.push(error instanceof Error ? error.message : String(error));
+                const message = error instanceof Error ? error.message : String(error);
+                console.error(JSON.stringify({
+                  event: "weixin_outbound_attachment_send_failed",
+                  index,
+                  filePath: attachment.path,
+                  error: message,
+                }));
+                outboundErrors.push(`${path.basename(attachment.path)}: ${message}`);
+              }
+              if (index < outbound.attachments.length - 1) {
+                await sleep(OUTBOUND_ATTACHMENT_GAP_MS);
               }
             }
             if (outboundErrors.length > 0) {

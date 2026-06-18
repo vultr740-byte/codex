@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv } from "node:crypto";
 
 const UPLOAD_MAX_RETRIES = 3;
+const UPLOAD_RETRY_BASE_DELAY_MS = 1_000;
 
 function buildCdnDownloadUrl(encryptedQueryParam: string, cdnBaseUrl: string): string {
   return `${ensureTrailingSlash(cdnBaseUrl)}download?encrypted_query_param=${encodeURIComponent(encryptedQueryParam)}`;
@@ -80,56 +81,96 @@ export async function uploadBufferToCdn(params: {
   filekey: string;
   cdnBaseUrl: string;
   aeskey: Buffer;
+  label?: string;
 }): Promise<{ downloadEncryptedQueryParam: string }> {
   const trimmedFullUrl = params.uploadFullUrl?.trim();
-  const uploadUrl = trimmedFullUrl || (params.uploadParam
-    ? buildCdnUploadUrl({
-        cdnBaseUrl: params.cdnBaseUrl,
-        uploadParam: params.uploadParam,
-        filekey: params.filekey,
-      })
-    : null);
-  if (!uploadUrl) {
+  const trimmedUploadParam = params.uploadParam?.trim();
+  const candidates = [
+    ...(trimmedFullUrl ? [{ mode: "upload_full_url", url: trimmedFullUrl }] : []),
+    ...(trimmedUploadParam
+      ? [{
+          mode: "upload_param",
+          url: buildCdnUploadUrl({
+            cdnBaseUrl: params.cdnBaseUrl,
+            uploadParam: trimmedUploadParam,
+            filekey: params.filekey,
+          }),
+        }]
+      : []),
+  ].filter((candidate, index, all) =>
+    all.findIndex((other) => other.url === candidate.url) === index
+  );
+  if (candidates.length === 0) {
     throw new Error("CDN upload URL missing.");
   }
 
   const ciphertext = encryptAesEcb(params.buffer, params.aeskey);
-  let downloadEncryptedQueryParam: string | undefined;
-  let lastError: unknown;
+  const errors: string[] = [];
 
-  for (let attempt = 1; attempt <= UPLOAD_MAX_RETRIES; attempt += 1) {
-    try {
-      const response = await fetch(uploadUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/octet-stream" },
-        body: new Uint8Array(ciphertext),
-      });
-      if (response.status >= 400 && response.status < 500) {
-        const body = response.headers.get("x-error-message") ?? await response.text().catch(() => "(unreadable)");
-        throw new Error(`CDN upload client error ${response.status}: ${body.slice(0, 500)}`);
-      }
-      if (response.status !== 200) {
+  for (const candidate of candidates) {
+    for (let attempt = 1; attempt <= UPLOAD_MAX_RETRIES; attempt += 1) {
+      try {
+        const response = await fetch(candidate.url, {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: new Uint8Array(ciphertext),
+        });
+        if (response.status === 200) {
+          const downloadEncryptedQueryParam = response.headers.get("x-encrypted-param")?.trim();
+          if (!downloadEncryptedQueryParam) {
+            throw new Error("CDN upload response missing x-encrypted-param header.");
+          }
+          console.log(JSON.stringify({
+            event: "weixin_cdn_upload_success",
+            label: params.label ?? null,
+            filekey: params.filekey,
+            mode: candidate.mode,
+            attempt,
+            ciphertextSize: ciphertext.length,
+          }));
+          return { downloadEncryptedQueryParam };
+        }
+
         const body = response.headers.get("x-error-message") ?? await response.text().catch(() => response.statusText || "(unreadable)");
-        throw new Error(`CDN upload server error ${response.status}: ${body.slice(0, 500)}`);
+        const message = response.status >= 400 && response.status < 500
+          ? `CDN upload client error ${response.status}: ${body.slice(0, 500)}`
+          : `CDN upload server error ${response.status}: ${body.slice(0, 500)}`;
+        errors.push(`${candidate.mode} attempt ${attempt}: ${message}`);
+        console.error(JSON.stringify({
+          event: "weixin_cdn_upload_failed",
+          label: params.label ?? null,
+          filekey: params.filekey,
+          mode: candidate.mode,
+          attempt,
+          status: response.status,
+          error: message,
+          ciphertextSize: ciphertext.length,
+        }));
+        if (response.status >= 400 && response.status < 500) {
+          break;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        errors.push(`${candidate.mode} attempt ${attempt}: ${message}`);
+        console.error(JSON.stringify({
+          event: "weixin_cdn_upload_failed",
+          label: params.label ?? null,
+          filekey: params.filekey,
+          mode: candidate.mode,
+          attempt,
+          error: message,
+          ciphertextSize: ciphertext.length,
+        }));
       }
-      downloadEncryptedQueryParam = response.headers.get("x-encrypted-param")?.trim();
-      if (!downloadEncryptedQueryParam) {
-        throw new Error("CDN upload response missing x-encrypted-param header.");
-      }
-      break;
-    } catch (error) {
-      lastError = error;
-      if (error instanceof Error && error.message.includes("client error")) {
-        throw error;
-      }
-      if (attempt === UPLOAD_MAX_RETRIES) {
-        break;
+      if (attempt < UPLOAD_MAX_RETRIES) {
+        await sleep(UPLOAD_RETRY_BASE_DELAY_MS * attempt);
       }
     }
   }
 
-  if (!downloadEncryptedQueryParam) {
-    throw lastError instanceof Error ? lastError : new Error(`CDN upload failed after ${UPLOAD_MAX_RETRIES} attempts.`);
-  }
-  return { downloadEncryptedQueryParam };
+  throw new Error(`CDN upload failed: ${errors.slice(-3).join("; ")}`);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -657,6 +657,480 @@ test("bridge sends Codex-declared output files as native Weixin attachments", as
   assert.ok(fileMessage?.item_list?.[0]?.file_item?.media?.aes_key);
 });
 
+test("bridge normalizes Codex-declared images before Weixin CDN upload", async (t) => {
+  const hasFfmpeg = await commandExists("ffmpeg");
+  const hasFfprobe = await commandExists("ffprobe");
+  if (!hasFfmpeg || !hasFfprobe) {
+    t.skip("ffmpeg/ffprobe are not available");
+    return;
+  }
+
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-bridge-"));
+  const imageFile = path.join(stateDir, "large.bmp");
+  fs.writeFileSync(imageFile, makeBmpImage(1_024, 1_024));
+  const originalSize = fs.statSync(imageFile).size;
+  assert.ok(originalSize > 200 * 1024);
+
+  const receivedWeixinRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];
+  const uploadedCdnBodies: Buffer[] = [];
+  let getUpdatesCount = 0;
+
+  const cdnServer = http.createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    if (req.method === "POST" && url.pathname === "/upload") {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      req.on("end", () => {
+        uploadedCdnBodies.push(Buffer.concat(chunks));
+        res.setHeader("x-encrypted-param", "image-param");
+        res.end("ok");
+      });
+      return;
+    }
+    res.writeHead(404);
+    res.end("not found");
+  });
+  const cdnBaseUrl = await listen(cdnServer);
+
+  const weixinServer = http.createServer((req, res) => {
+    const endpoint = new URL(req.url ?? "/", "http://localhost").pathname.replace(/^\/+/, "");
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk.toString("utf8");
+    });
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) as Record<string, unknown> : {};
+      receivedWeixinRequests.push({ endpoint, body });
+      res.setHeader("content-type", "application/json");
+
+      if (endpoint === "ilink/bot/getupdates") {
+        getUpdatesCount += 1;
+        if (getUpdatesCount === 1) {
+          res.end(JSON.stringify({
+            ret: 0,
+            get_updates_buf: "buf-1",
+            msgs: [
+              {
+                message_id: "msg-1",
+                from_user_id: "user-1",
+                context_token: "ctx-1",
+                item_list: [{ type: 1, text_item: { text: "send me the image" } }],
+              },
+            ],
+          }));
+          return;
+        }
+        res.end(JSON.stringify({ ret: 0, get_updates_buf: "buf-1", msgs: [] }));
+        return;
+      }
+
+      if (endpoint === "ilink/bot/getconfig") {
+        res.end(JSON.stringify({ ret: 0, typing_ticket: "ticket-1" }));
+        return;
+      }
+
+      if (endpoint === "ilink/bot/getuploadurl") {
+        res.end(JSON.stringify({
+          ret: 0,
+          upload_param: "upload-param",
+        }));
+        return;
+      }
+
+      res.end(JSON.stringify({ ret: 0 }));
+    });
+  });
+
+  const weixinBaseUrl = await listen(weixinServer);
+  const appServer = new WebSocketServer({ port: 0 });
+  await new Promise<void>((resolve) => {
+    appServer.once("listening", resolve);
+  });
+  appServer.on("connection", (ws) => {
+    ws.on("message", (data) => {
+      const message = JSON.parse(data.toString()) as {
+        id?: number;
+        method?: string;
+      };
+
+      if (message.id !== undefined && message.method === "initialize") {
+        ws.send(JSON.stringify({ id: message.id, result: {} }));
+        return;
+      }
+      if (message.id !== undefined && message.method === "thread/start") {
+        ws.send(JSON.stringify({ id: message.id, result: { thread: { id: "thread-1" } } }));
+        return;
+      }
+      if (message.id !== undefined && message.method === "turn/start") {
+        ws.send(JSON.stringify({ id: message.id, result: { turn: { id: "turn-1" } } }));
+        setTimeout(() => {
+          ws.send(JSON.stringify({
+            method: "item/agentMessage/delta",
+            params: {
+              turnId: "turn-1",
+              delta: [
+                "Here is the image.",
+                "",
+                "```codex-weixin-attachments",
+                JSON.stringify({ attachments: [{ path: imageFile }] }),
+                "```",
+              ].join("\n"),
+            },
+          }));
+          ws.send(JSON.stringify({
+            method: "turn/completed",
+            params: { turn: { id: "turn-1", status: "completed" } },
+          }));
+        }, 50);
+      }
+    });
+  });
+
+  const appServerAddress = appServer.address();
+  assert.ok(appServerAddress && typeof appServerAddress !== "string");
+  const appServerUrl = `ws://127.0.0.1:${appServerAddress.port}`;
+  const bridge = new Bridge({
+    appServerUrl,
+    appServerToken: "codex-token",
+    weixinBaseUrl,
+    weixinCdnBaseUrl: cdnBaseUrl,
+    weixinToken: "weixin-token",
+    controlApiToken: null,
+    stateDir,
+    uploadDir: path.join(stateDir, "uploads"),
+    codexThreadMode: "per_user",
+    defaultCwd: null,
+  });
+
+  const bridgeTask = bridge.start();
+
+  try {
+    await waitFor(() =>
+      receivedWeixinRequests.some((request) => request.endpoint === "ilink/bot/sendmessage" &&
+        ((request.body.msg as { item_list?: Array<{ image_item?: unknown }> } | undefined)
+          ?.item_list?.some((item) => item.image_item)))
+    );
+  } finally {
+    await bridge.stop();
+    appServer.close();
+    weixinServer.close();
+    cdnServer.close();
+    await bridgeTask;
+  }
+
+  assert.equal(uploadedCdnBodies.length, 1);
+  assert.ok(uploadedCdnBodies[0].length < originalSize);
+
+  const uploadRequest = receivedWeixinRequests.find((request) => request.endpoint === "ilink/bot/getuploadurl");
+  assert.ok(uploadRequest);
+  assert.ok(Number(uploadRequest.body.rawsize) < originalSize);
+});
+
+test("bridge reports oversized image attachments when media tools are unavailable", async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-bridge-"));
+  const imageFile = path.join(stateDir, "large.bmp");
+  fs.writeFileSync(imageFile, makeBmpImage(1_024, 1_024));
+  const receivedWeixinRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];
+  let getUpdatesCount = 0;
+
+  const weixinServer = http.createServer((req, res) => {
+    const endpoint = new URL(req.url ?? "/", "http://localhost").pathname.replace(/^\/+/, "");
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk.toString("utf8");
+    });
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) as Record<string, unknown> : {};
+      receivedWeixinRequests.push({ endpoint, body });
+      res.setHeader("content-type", "application/json");
+
+      if (endpoint === "ilink/bot/getupdates") {
+        getUpdatesCount += 1;
+        if (getUpdatesCount === 1) {
+          res.end(JSON.stringify({
+            ret: 0,
+            get_updates_buf: "buf-1",
+            msgs: [
+              {
+                message_id: "msg-1",
+                from_user_id: "user-1",
+                context_token: "ctx-1",
+                item_list: [{ type: 1, text_item: { text: "send me the image" } }],
+              },
+            ],
+          }));
+          return;
+        }
+        res.end(JSON.stringify({ ret: 0, get_updates_buf: "buf-1", msgs: [] }));
+        return;
+      }
+
+      if (endpoint === "ilink/bot/getconfig") {
+        res.end(JSON.stringify({ ret: 0, typing_ticket: "ticket-1" }));
+        return;
+      }
+
+      res.end(JSON.stringify({ ret: 0 }));
+    });
+  });
+
+  const weixinBaseUrl = await listen(weixinServer);
+  const appServer = new WebSocketServer({ port: 0 });
+  await new Promise<void>((resolve) => {
+    appServer.once("listening", resolve);
+  });
+  appServer.on("connection", (ws) => {
+    ws.on("message", (data) => {
+      const message = JSON.parse(data.toString()) as {
+        id?: number;
+        method?: string;
+      };
+
+      if (message.id !== undefined && message.method === "initialize") {
+        ws.send(JSON.stringify({ id: message.id, result: {} }));
+        return;
+      }
+      if (message.id !== undefined && message.method === "thread/start") {
+        ws.send(JSON.stringify({ id: message.id, result: { thread: { id: "thread-1" } } }));
+        return;
+      }
+      if (message.id !== undefined && message.method === "turn/start") {
+        ws.send(JSON.stringify({ id: message.id, result: { turn: { id: "turn-1" } } }));
+        setTimeout(() => {
+          ws.send(JSON.stringify({
+            method: "item/agentMessage/delta",
+            params: {
+              turnId: "turn-1",
+              delta: [
+                "```codex-weixin-attachments",
+                JSON.stringify({ attachments: [{ path: imageFile }] }),
+                "```",
+              ].join("\n"),
+            },
+          }));
+          ws.send(JSON.stringify({
+            method: "turn/completed",
+            params: { turn: { id: "turn-1", status: "completed" } },
+          }));
+        }, 50);
+      }
+    });
+  });
+
+  const previousFfmpegPath = process.env.CODEX_WEIXIN_FFMPEG_PATH;
+  const previousFfprobePath = process.env.CODEX_WEIXIN_FFPROBE_PATH;
+  process.env.CODEX_WEIXIN_FFMPEG_PATH = path.join(stateDir, "missing-ffmpeg");
+  process.env.CODEX_WEIXIN_FFPROBE_PATH = path.join(stateDir, "missing-ffprobe");
+
+  const appServerAddress = appServer.address();
+  assert.ok(appServerAddress && typeof appServerAddress !== "string");
+  const appServerUrl = `ws://127.0.0.1:${appServerAddress.port}`;
+  const bridge = new Bridge({
+    appServerUrl,
+    appServerToken: "codex-token",
+    weixinBaseUrl,
+    weixinCdnBaseUrl: weixinBaseUrl,
+    weixinToken: "weixin-token",
+    controlApiToken: null,
+    stateDir,
+    uploadDir: path.join(stateDir, "uploads"),
+    codexThreadMode: "per_user",
+    defaultCwd: null,
+  });
+
+  const bridgeTask = bridge.start();
+
+  try {
+    await waitFor(() =>
+      receivedWeixinRequests.some((request) => request.endpoint === "ilink/bot/sendmessage" &&
+        /附件发送失败/u.test(((request.body.msg as { item_list?: Array<{ text_item?: { text?: string } }> } | undefined)
+          ?.item_list?.[0]?.text_item?.text) ?? ""))
+    );
+  } finally {
+    if (previousFfmpegPath === undefined) {
+      delete process.env.CODEX_WEIXIN_FFMPEG_PATH;
+    } else {
+      process.env.CODEX_WEIXIN_FFMPEG_PATH = previousFfmpegPath;
+    }
+    if (previousFfprobePath === undefined) {
+      delete process.env.CODEX_WEIXIN_FFPROBE_PATH;
+    } else {
+      process.env.CODEX_WEIXIN_FFPROBE_PATH = previousFfprobePath;
+    }
+    await bridge.stop();
+    appServer.close();
+    weixinServer.close();
+    await bridgeTask;
+  }
+
+  assert.equal(receivedWeixinRequests.some((request) => request.endpoint === "ilink/bot/getuploadurl"), false);
+  const failureMessage = receivedWeixinRequests
+    .filter((request) => request.endpoint === "ilink/bot/sendmessage")
+    .map((request) => (request.body.msg as { item_list?: Array<{ text_item?: { text?: string } }> } | undefined)
+      ?.item_list?.[0]?.text_item?.text ?? "")
+    .find((text) => /附件发送失败/u.test(text)) ?? "";
+  assert.match(failureMessage, /ffmpeg\/ffprobe are unavailable/u);
+});
+
+test("bridge falls back from upload_full_url to upload_param when Weixin CDN rejects the full URL", async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-bridge-"));
+  const outputFile = path.join(stateDir, "answer.zip");
+  fs.writeFileSync(outputFile, "zip bytes", "utf8");
+  const receivedWeixinRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];
+  const uploadPaths: string[] = [];
+  let getUpdatesCount = 0;
+
+  const cdnServer = http.createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    if (req.method === "POST" && (url.pathname === "/full-upload" || url.pathname === "/upload")) {
+      req.resume();
+      req.on("end", () => {
+        uploadPaths.push(url.pathname);
+        if (url.pathname === "/full-upload") {
+          res.writeHead(500);
+          res.end("full url failed");
+          return;
+        }
+        res.setHeader("x-encrypted-param", "fallback-param");
+        res.end("ok");
+      });
+      return;
+    }
+    res.writeHead(404);
+    res.end("not found");
+  });
+  const cdnBaseUrl = await listen(cdnServer);
+
+  const weixinServer = http.createServer((req, res) => {
+    const endpoint = new URL(req.url ?? "/", "http://localhost").pathname.replace(/^\/+/, "");
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk.toString("utf8");
+    });
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) as Record<string, unknown> : {};
+      receivedWeixinRequests.push({ endpoint, body });
+      res.setHeader("content-type", "application/json");
+
+      if (endpoint === "ilink/bot/getupdates") {
+        getUpdatesCount += 1;
+        if (getUpdatesCount === 1) {
+          res.end(JSON.stringify({
+            ret: 0,
+            get_updates_buf: "buf-1",
+            msgs: [
+              {
+                message_id: "msg-1",
+                from_user_id: "user-1",
+                context_token: "ctx-1",
+                item_list: [{ type: 1, text_item: { text: "send me the zip" } }],
+              },
+            ],
+          }));
+          return;
+        }
+        res.end(JSON.stringify({ ret: 0, get_updates_buf: "buf-1", msgs: [] }));
+        return;
+      }
+
+      if (endpoint === "ilink/bot/getconfig") {
+        res.end(JSON.stringify({ ret: 0, typing_ticket: "ticket-1" }));
+        return;
+      }
+
+      if (endpoint === "ilink/bot/getuploadurl") {
+        res.end(JSON.stringify({
+          ret: 0,
+          upload_full_url: `${cdnBaseUrl}/full-upload`,
+          upload_param: "upload-param",
+        }));
+        return;
+      }
+
+      res.end(JSON.stringify({ ret: 0 }));
+    });
+  });
+
+  const weixinBaseUrl = await listen(weixinServer);
+  const appServer = new WebSocketServer({ port: 0 });
+  await new Promise<void>((resolve) => {
+    appServer.once("listening", resolve);
+  });
+  appServer.on("connection", (ws) => {
+    ws.on("message", (data) => {
+      const message = JSON.parse(data.toString()) as {
+        id?: number;
+        method?: string;
+      };
+
+      if (message.id !== undefined && message.method === "initialize") {
+        ws.send(JSON.stringify({ id: message.id, result: {} }));
+        return;
+      }
+      if (message.id !== undefined && message.method === "thread/start") {
+        ws.send(JSON.stringify({ id: message.id, result: { thread: { id: "thread-1" } } }));
+        return;
+      }
+      if (message.id !== undefined && message.method === "turn/start") {
+        ws.send(JSON.stringify({ id: message.id, result: { turn: { id: "turn-1" } } }));
+        setTimeout(() => {
+          ws.send(JSON.stringify({
+            method: "item/agentMessage/delta",
+            params: {
+              turnId: "turn-1",
+              delta: [
+                "```codex-weixin-attachments",
+                JSON.stringify({ attachments: [{ path: outputFile }] }),
+                "```",
+              ].join("\n"),
+            },
+          }));
+          ws.send(JSON.stringify({
+            method: "turn/completed",
+            params: { turn: { id: "turn-1", status: "completed" } },
+          }));
+        }, 50);
+      }
+    });
+  });
+
+  const appServerAddress = appServer.address();
+  assert.ok(appServerAddress && typeof appServerAddress !== "string");
+  const appServerUrl = `ws://127.0.0.1:${appServerAddress.port}`;
+  const bridge = new Bridge({
+    appServerUrl,
+    appServerToken: "codex-token",
+    weixinBaseUrl,
+    weixinCdnBaseUrl: cdnBaseUrl,
+    weixinToken: "weixin-token",
+    controlApiToken: null,
+    stateDir,
+    uploadDir: path.join(stateDir, "uploads"),
+    codexThreadMode: "per_user",
+    defaultCwd: null,
+  });
+
+  const bridgeTask = bridge.start();
+
+  try {
+    await waitFor(() =>
+      receivedWeixinRequests.some((request) => request.endpoint === "ilink/bot/sendmessage" &&
+        ((request.body.msg as { item_list?: Array<{ file_item?: { media?: { encrypt_query_param?: string } } }> } | undefined)
+          ?.item_list?.some((item) => item.file_item?.media?.encrypt_query_param === "fallback-param")))
+    );
+  } finally {
+    await bridge.stop();
+    appServer.close();
+    weixinServer.close();
+    cdnServer.close();
+    await bridgeTask;
+  }
+
+  assert.deepEqual(uploadPaths, ["/full-upload", "/full-upload", "/full-upload", "/upload"]);
+});
+
 test("bridge sends a billing failure message when a Codex turn fails with payment error", async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-bridge-"));
   const receivedWeixinRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];
@@ -802,7 +1276,7 @@ function encryptAesEcb(plaintext: Buffer, key: Buffer): Buffer {
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-  const deadline = Date.now() + 2_000;
+  const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     if (predicate()) {
       return;
@@ -810,4 +1284,40 @@ async function waitFor(predicate: () => boolean): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   assert.fail("Timed out waiting for bridge side effects.");
+}
+
+async function commandExists(command: string): Promise<boolean> {
+  const { spawn } = await import("node:child_process");
+  return new Promise((resolve) => {
+    const child = spawn(command, ["-version"], { stdio: "ignore" });
+    child.on("error", () => resolve(false));
+    child.on("exit", (code) => resolve(code === 0));
+  });
+}
+
+function makeBmpImage(width: number, height: number): Buffer {
+  const rowSize = Math.ceil((width * 3) / 4) * 4;
+  const pixelDataSize = rowSize * height;
+  const fileSize = 54 + pixelDataSize;
+  const header = Buffer.alloc(54);
+  header.write("BM", 0, "ascii");
+  header.writeUInt32LE(fileSize, 2);
+  header.writeUInt32LE(54, 10);
+  header.writeUInt32LE(40, 14);
+  header.writeInt32LE(width, 18);
+  header.writeInt32LE(height, 22);
+  header.writeUInt16LE(1, 26);
+  header.writeUInt16LE(24, 28);
+  header.writeUInt32LE(pixelDataSize, 34);
+
+  const pixels = Buffer.alloc(pixelDataSize);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const offset = ((height - 1 - y) * rowSize) + (x * 3);
+      pixels[offset] = (x * 17 + y * 3) % 256;
+      pixels[offset + 1] = (x * 5 + y * 11) % 256;
+      pixels[offset + 2] = (x * 13 + y * 7) % 256;
+    }
+  }
+  return Buffer.concat([header, pixels]);
 }
