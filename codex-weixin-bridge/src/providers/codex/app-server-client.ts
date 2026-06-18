@@ -1,6 +1,17 @@
 import WebSocket from "ws";
+import type { InboundAttachment } from "../../types.js";
 
 type JsonObject = Record<string, unknown>;
+type CodexTurnInput =
+  | {
+      type: "text";
+      text: string;
+      text_elements: [];
+    }
+  | {
+      type: "localImage";
+      path: string;
+    };
 
 type PendingRequest = {
   method: string;
@@ -81,6 +92,7 @@ export class CodexAppServerClient {
   async sendTurn(params: {
     threadId: string;
     text: string;
+    attachments?: InboundAttachment[];
     clientUserMessageId?: string | null;
     timeoutMs?: number;
   }): Promise<CodexTurnResult> {
@@ -88,13 +100,7 @@ export class CodexAppServerClient {
     const turn = await this.send("turn/start", {
       threadId: params.threadId,
       ...(params.clientUserMessageId ? { clientUserMessageId: params.clientUserMessageId } : {}),
-      input: [
-        {
-          type: "text",
-          text: params.text,
-          text_elements: [],
-        },
-      ],
+      input: buildCodexTurnInput(params.text, params.attachments ?? []),
     }) as { turn?: { id?: unknown } };
     const turnId = normalizeText(turn.turn?.id);
     if (!turnId) {
@@ -299,6 +305,71 @@ export class CodexAppServerClient {
 
   private singleActiveTurnId(): string | null {
     return this.activeTurns.size === 1 ? [...this.activeTurns.keys()][0] : null;
+  }
+}
+
+function buildCodexTurnInput(text: string, attachments: InboundAttachment[]): CodexTurnInput[] {
+  const prompt = attachments.length === 0 ? text : buildAttachmentPrompt(text, attachments);
+  const input: CodexTurnInput[] = [
+    {
+      type: "text",
+      text: prompt,
+      text_elements: [],
+    },
+  ];
+  for (const attachment of attachments) {
+    if (attachment.kind === "image") {
+      input.push({
+        type: "localImage",
+        path: attachment.localPath,
+      });
+    }
+  }
+  return input;
+}
+
+function buildAttachmentPrompt(text: string, attachments: InboundAttachment[]): string {
+  const lines: string[] = [];
+  const normalizedText = text.trim();
+  if (normalizedText) {
+    lines.push(normalizedText, "");
+  } else {
+    lines.push("User sent Weixin attachments without additional text.", "");
+  }
+  lines.push("Weixin attachments:");
+  attachments.forEach((attachment, index) => {
+    lines.push(`${index + 1}. ${describeAttachment(attachment)}`);
+    lines.push(`   path: ${attachment.localPath}`);
+    if (attachment.fileName) {
+      lines.push(`   filename: ${attachment.fileName}`);
+    }
+    if (attachment.mimeType) {
+      lines.push(`   mime: ${attachment.mimeType}`);
+    }
+    if (typeof attachment.durationSeconds === "number" && Number.isFinite(attachment.durationSeconds)) {
+      lines.push(`   duration_seconds: ${attachment.durationSeconds}`);
+    }
+    if (attachment.transcriptText) {
+      lines.push(`   transcript_hint: ${attachment.transcriptText}`);
+    }
+    if (attachment.kind === "image") {
+      lines.push("   attached_as: localImage");
+    }
+  });
+  lines.push("", "Use the local file paths above when you inspect these attachments.");
+  return lines.join("\n");
+}
+
+function describeAttachment(attachment: InboundAttachment): string {
+  switch (attachment.kind) {
+    case "image":
+      return "image";
+    case "voice":
+      return "voice";
+    case "file":
+      return "file";
+    case "video":
+      return "video";
   }
 }
 

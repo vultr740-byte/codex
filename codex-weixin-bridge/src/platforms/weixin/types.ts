@@ -17,13 +17,52 @@ export const MessageState = {
   FINISH: 2,
 } as const;
 
+export type CdnMedia = {
+  encrypt_query_param?: string;
+  aes_key?: string;
+  encrypt_type?: number;
+  full_url?: string;
+};
+
 export type MessageItem = {
   type?: number;
+  image_item?: {
+    media?: CdnMedia;
+    thumb_media?: CdnMedia;
+    aeskey?: string;
+    url?: string;
+    mid_size?: number;
+    thumb_size?: number;
+    thumb_height?: number;
+    thumb_width?: number;
+    hd_size?: number;
+  };
   text_item?: {
     text?: string;
   };
   voice_item?: {
+    media?: CdnMedia;
+    encode_type?: number;
+    bits_per_sample?: number;
+    sample_rate?: number;
+    playtime?: number;
     text?: string;
+  };
+  file_item?: {
+    media?: CdnMedia;
+    file_name?: string;
+    md5?: string;
+    len?: string;
+  };
+  video_item?: {
+    media?: CdnMedia;
+    video_size?: number;
+    play_length?: number;
+    video_md5?: string;
+    thumb_media?: CdnMedia;
+    thumb_size?: number;
+    thumb_height?: number;
+    thumb_width?: number;
   };
   ref_msg?: {
     title?: string;

@@ -4,6 +4,8 @@ import type { BridgeConfig } from "../types.js";
 import { DedupStore } from "../store/dedup-store.js";
 import { ThreadBindingStore } from "../store/thread-binding-store.js";
 import { WeixinAccountStore } from "../store/weixin-account-store.js";
+import { downloadInboundAttachments } from "../media/inbound-attachments.js";
+import type { MessageItem } from "../platforms/weixin/types.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -77,9 +79,17 @@ export class Bridge {
           this.dedup.add(messageId);
 
           const text = extractText(msg.item_list);
-          if (!text) {
+          const { attachments, errors: attachmentErrors } = await downloadInboundAttachments({
+            items: msg.item_list,
+            cdnBaseUrl: this.config.weixinCdnBaseUrl,
+            uploadDir: this.config.uploadDir,
+            weixinUserId: fromUserId,
+            messageId,
+          });
+          if (!text && attachments.length === 0 && attachmentErrors.length === 0) {
             continue;
           }
+          const turnText = appendAttachmentErrors(text, attachmentErrors);
 
           const typingTicket = await this.getTypingTicket({
             baseUrl,
@@ -105,7 +115,8 @@ export class Bridge {
           try {
             result = await this.codex.sendTurn({
               threadId,
-              text,
+              text: turnText,
+              attachments,
               clientUserMessageId: messageId,
             });
           } catch (error) {
@@ -116,7 +127,8 @@ export class Bridge {
                 this.saveThreadBinding(fromUserId, threadId);
                 result = await this.codex.sendTurn({
                   threadId,
-                  text,
+                  text: turnText,
+                  attachments,
                   clientUserMessageId: messageId,
                 });
               } catch (retryError) {
@@ -278,7 +290,7 @@ export class Bridge {
   }
 }
 
-function extractText(items: Array<{ type?: number; text_item?: { text?: string }; voice_item?: { text?: string } } | undefined> | undefined): string {
+function extractText(items: Array<MessageItem | undefined> | undefined): string {
   for (const item of items ?? []) {
     if (item?.type === 1 && typeof item.text_item?.text === "string") {
       return item.text_item.text.trim();
@@ -288,6 +300,18 @@ function extractText(items: Array<{ type?: number; text_item?: { text?: string }
     }
   }
   return "";
+}
+
+function appendAttachmentErrors(text: string, errors: string[]): string {
+  if (errors.length === 0) {
+    return text;
+  }
+  const lines = text.trim() ? [text.trim(), ""] : [];
+  lines.push("Some Weixin attachments could not be downloaded:");
+  errors.forEach((error, index) => {
+    lines.push(`${index + 1}. ${error}`);
+  });
+  return lines.join("\n");
 }
 
 function isApiError(resp: { ret?: number; errcode?: number }): boolean {

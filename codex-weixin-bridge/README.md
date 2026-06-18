@@ -22,9 +22,11 @@ inside the same container.
 - `CODEX_APP_SERVER_URL`
 - `CODEX_APP_SERVER_TOKEN`
 - `WEIXIN_BASE_URL`
+- `WEIXIN_CDN_BASE_URL` optional, defaults to `https://novac2c.cdn.weixin.qq.com/c2c`
 - `WEIXIN_TOKEN` optional fallback for existing installs
 - `CONTROL_API_TOKEN` optional bearer token for control endpoints
 - `CODEX_WEIXIN_STATE_DIR` optional, defaults to `./state`
+- `CODEX_WEIXIN_UPLOAD_DIR` optional, defaults to `$CODEX_WEIXIN_STATE_DIR/uploads`
 - `CODEX_THREAD_MODE` optional, defaults to `per_user`
 - `CODEX_DEFAULT_CWD` optional
 - `PORT` optional, defaults to `3000`
@@ -49,6 +51,7 @@ Required runtime variables for Weixin mode:
 - `CODEX_APP_SERVER_TOKEN`
 - `CODEX_APP_SERVER_URL`
 - `WEIXIN_BASE_URL`
+- `WEIXIN_CDN_BASE_URL` optional
 - `CONTROL_API_TOKEN` recommended
 
 ## Control API
@@ -82,7 +85,10 @@ If `CONTROL_API_TOKEN` is set, send `Authorization: Bearer <token>` to the contr
 
 ## Notes
 
-- The bridge is text-first in this version.
+- The bridge forwards text, voice transcript text, and inbound attachments.
+  Attachments are downloaded into `CODEX_WEIXIN_UPLOAD_DIR` and described to
+  Codex as local file paths. Images are also sent to app-server as `localImage`
+  inputs.
 - Typing indicators are best-effort. If the Weixin account exposes a typing
   ticket, the bridge sends `sendtyping` while a Codex turn is running and
   cancels it when the turn completes.
