@@ -20,6 +20,16 @@ type PendingRequest = {
   timeout: ReturnType<typeof setTimeout>;
 };
 
+const WEIXIN_DEVELOPER_INSTRUCTIONS = [
+  "You are replying through a Weixin bridge.",
+  "When the user asks you to send a generated local file as an attachment, do not use a markdown link as the only delivery mechanism.",
+  "Create the file on disk, then include a fenced JSON block exactly like:",
+  "```codex-weixin-attachments",
+  "{\"attachments\":[{\"path\":\"/absolute/path/to/file.zip\",\"caption\":\"optional short caption\"}]}",
+  "```",
+  "The bridge will upload those paths and send them as native Weixin attachment payloads. Keep normal user-facing text outside the fenced block.",
+].join("\n");
+
 export type CodexTurnResult = {
   assistantText: string;
   threadId: string;
@@ -81,6 +91,7 @@ export class CodexAppServerClient {
       ...(this.defaultCwd ? { cwd: this.defaultCwd } : {}),
       approvalPolicy: "never",
       sandbox: "danger-full-access",
+      developerInstructions: WEIXIN_DEVELOPER_INSTRUCTIONS,
     }) as { thread?: { id?: unknown } };
     const threadId = normalizeText(result.thread?.id);
     if (!threadId) {

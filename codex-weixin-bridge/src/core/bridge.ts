@@ -5,6 +5,8 @@ import { DedupStore } from "../store/dedup-store.js";
 import { ThreadBindingStore } from "../store/thread-binding-store.js";
 import { WeixinAccountStore } from "../store/weixin-account-store.js";
 import { downloadInboundAttachments } from "../media/inbound-attachments.js";
+import { extractOutboundAttachmentManifest } from "../media/attachment-manifest.js";
+import { sendWeixinMediaFile } from "../media/outbound-attachments.js";
 import type { MessageItem } from "../platforms/weixin/types.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -155,13 +157,44 @@ export class Bridge {
           this.threadBindings.updateWeixinUserId(fromUserId, { updatedAt: Date.now() });
 
           if (result?.assistantText) {
-            await sendTextMessage({
-              baseUrl,
-              token,
-              toUserId: fromUserId,
-              text: result.assistantText,
-              contextToken: msg.context_token ?? null,
-            });
+            const outbound = extractOutboundAttachmentManifest(result.assistantText);
+            const replyText = outbound.text;
+            if (replyText) {
+              await sendTextMessage({
+                baseUrl,
+                token,
+                toUserId: fromUserId,
+                text: replyText,
+                contextToken: msg.context_token ?? null,
+              });
+            }
+            const outboundErrors = [...outbound.errors];
+            for (const attachment of outbound.attachments) {
+              try {
+                await sendWeixinMediaFile({
+                  filePath: attachment.path,
+                  toUserId: fromUserId,
+                  text: attachment.caption ?? "",
+                  options: {
+                    baseUrl,
+                    token,
+                    contextToken: msg.context_token ?? null,
+                  },
+                  cdnBaseUrl: this.config.weixinCdnBaseUrl,
+                });
+              } catch (error) {
+                outboundErrors.push(error instanceof Error ? error.message : String(error));
+              }
+            }
+            if (outboundErrors.length > 0) {
+              await sendTextMessage({
+                baseUrl,
+                token,
+                toUserId: fromUserId,
+                text: `⚠️ 附件发送失败：\n${outboundErrors.map((error, index) => `${index + 1}. ${error}`).join("\n")}`,
+                contextToken: msg.context_token ?? null,
+              });
+            }
           }
         }
       } catch (error) {

@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 
-import type { GetUpdatesResponse } from "./types.js";
+import type { GetUpdatesResponse, GetUploadUrlResponse, UploadMediaType } from "./types.js";
 
 export type WeixinApiOptions = {
   baseUrl: string;
@@ -78,6 +78,112 @@ export async function sendTyping(params: WeixinApiOptions & {
     ilink_user_id: params.toUserId,
     typing_ticket: params.typingTicket,
     status: params.status,
+  });
+}
+
+export async function getUploadUrl(params: WeixinApiOptions & {
+  filekey: string;
+  mediaType: (typeof UploadMediaType)[keyof typeof UploadMediaType];
+  toUserId: string;
+  rawsize: number;
+  rawfilemd5: string;
+  filesize: number;
+  thumbRawsize?: number;
+  thumbRawfilemd5?: string;
+  thumbFilesize?: number;
+  noNeedThumb?: boolean;
+  aeskey: string;
+}): Promise<GetUploadUrlResponse> {
+  const response = await postJson(params, "ilink/bot/getuploadurl", {
+    filekey: params.filekey,
+    media_type: params.mediaType,
+    to_user_id: params.toUserId,
+    rawsize: params.rawsize,
+    rawfilemd5: params.rawfilemd5,
+    filesize: params.filesize,
+    ...(params.thumbRawsize !== undefined ? { thumb_rawsize: params.thumbRawsize } : {}),
+    ...(params.thumbRawfilemd5 !== undefined ? { thumb_rawfilemd5: params.thumbRawfilemd5 } : {}),
+    ...(params.thumbFilesize !== undefined ? { thumb_filesize: params.thumbFilesize } : {}),
+    ...(params.noNeedThumb ? { no_need_thumb: params.noNeedThumb } : {}),
+    aeskey: params.aeskey,
+  });
+  return response as GetUploadUrlResponse;
+}
+
+export async function sendImageMessage(params: WeixinApiOptions & {
+  toUserId: string;
+  text: string;
+  uploaded: {
+    downloadEncryptedQueryParam: string;
+    aeskey: string;
+    fileSizeCiphertext: number;
+  };
+  contextToken?: string | null;
+}): Promise<void> {
+  await sendMediaMessage(params, {
+    item: {
+      type: 2,
+      image_item: {
+        media: {
+          encrypt_query_param: params.uploaded.downloadEncryptedQueryParam,
+          aes_key: Buffer.from(params.uploaded.aeskey).toString("base64"),
+          encrypt_type: 1,
+        },
+        mid_size: params.uploaded.fileSizeCiphertext,
+      },
+    },
+  });
+}
+
+export async function sendVideoMessage(params: WeixinApiOptions & {
+  toUserId: string;
+  text: string;
+  uploaded: {
+    downloadEncryptedQueryParam: string;
+    aeskey: string;
+    fileSizeCiphertext: number;
+  };
+  contextToken?: string | null;
+}): Promise<void> {
+  await sendMediaMessage(params, {
+    item: {
+      type: 5,
+      video_item: {
+        media: {
+          encrypt_query_param: params.uploaded.downloadEncryptedQueryParam,
+          aes_key: Buffer.from(params.uploaded.aeskey).toString("base64"),
+          encrypt_type: 1,
+        },
+        video_size: params.uploaded.fileSizeCiphertext,
+      },
+    },
+  });
+}
+
+export async function sendFileMessage(params: WeixinApiOptions & {
+  toUserId: string;
+  text: string;
+  fileName: string;
+  uploaded: {
+    downloadEncryptedQueryParam: string;
+    aeskey: string;
+    fileSize: number;
+  };
+  contextToken?: string | null;
+}): Promise<void> {
+  await sendMediaMessage(params, {
+    item: {
+      type: 4,
+      file_item: {
+        media: {
+          encrypt_query_param: params.uploaded.downloadEncryptedQueryParam,
+          aes_key: Buffer.from(params.uploaded.aeskey).toString("base64"),
+          encrypt_type: 1,
+        },
+        file_name: params.fileName,
+        len: String(params.uploaded.fileSize),
+      },
+    },
   });
 }
 
@@ -190,6 +296,35 @@ async function getJson(params: {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function sendMediaMessage(
+  params: WeixinApiOptions & {
+    toUserId: string;
+    text: string;
+    contextToken?: string | null;
+  },
+  media: {
+    item: Record<string, unknown>;
+  },
+): Promise<void> {
+  const itemList: Array<Record<string, unknown>> = [];
+  if (params.text.trim()) {
+    itemList.push({ type: 1, text_item: { text: params.text } });
+  }
+  itemList.push(media.item);
+  await postJson(params, "ilink/bot/sendmessage", {
+    msg: {
+      from_user_id: "",
+      to_user_id: params.toUserId,
+      client_id: `codex-weixin-${crypto.randomUUID()}`,
+      message_type: 2,
+      message_state: 2,
+      item_list: itemList,
+      ...(params.contextToken ? { context_token: params.contextToken } : {}),
+    },
+    base_info: buildBaseInfo(),
+  });
 }
 
 function ensureTrailingSlash(value: string): string {

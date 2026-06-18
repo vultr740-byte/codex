@@ -1,7 +1,15 @@
-import { createDecipheriv } from "node:crypto";
+import { createCipheriv, createDecipheriv } from "node:crypto";
 
 function buildCdnDownloadUrl(encryptedQueryParam: string, cdnBaseUrl: string): string {
   return `${ensureTrailingSlash(cdnBaseUrl)}download?encrypted_query_param=${encodeURIComponent(encryptedQueryParam)}`;
+}
+
+function buildCdnUploadUrl(params: {
+  cdnBaseUrl: string;
+  uploadParam: string;
+  filekey: string;
+}): string {
+  return `${ensureTrailingSlash(params.cdnBaseUrl)}upload?encrypted_query_param=${encodeURIComponent(params.uploadParam)}&filekey=${encodeURIComponent(params.filekey)}`;
 }
 
 function ensureTrailingSlash(value: string): string {
@@ -33,6 +41,15 @@ function decryptAesEcb(ciphertext: Buffer, key: Buffer): Buffer {
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
 
+function encryptAesEcb(plaintext: Buffer, key: Buffer): Buffer {
+  const cipher = createCipheriv("aes-128-ecb", key, null);
+  return Buffer.concat([cipher.update(plaintext), cipher.final()]);
+}
+
+export function aesEcbPaddedSize(plaintextSize: number): number {
+  return Math.ceil((plaintextSize + 1) / 16) * 16;
+}
+
 export async function downloadAndDecryptBuffer(params: {
   encryptedQueryParam: string;
   aesKeyBase64: string;
@@ -52,4 +69,41 @@ export async function downloadPlainCdnBuffer(params: {
 }): Promise<Buffer> {
   const url = params.fullUrl?.trim() || buildCdnDownloadUrl(params.encryptedQueryParam, params.cdnBaseUrl);
   return fetchCdnBytes(url);
+}
+
+export async function uploadBufferToCdn(params: {
+  buffer: Buffer;
+  uploadFullUrl?: string | null;
+  uploadParam?: string | null;
+  filekey: string;
+  cdnBaseUrl: string;
+  aeskey: Buffer;
+}): Promise<{ downloadEncryptedQueryParam: string }> {
+  const trimmedFullUrl = params.uploadFullUrl?.trim();
+  const uploadUrl = trimmedFullUrl || (params.uploadParam
+    ? buildCdnUploadUrl({
+        cdnBaseUrl: params.cdnBaseUrl,
+        uploadParam: params.uploadParam,
+        filekey: params.filekey,
+      })
+    : null);
+  if (!uploadUrl) {
+    throw new Error("CDN upload URL missing.");
+  }
+
+  const ciphertext = encryptAesEcb(params.buffer, params.aeskey);
+  const response = await fetch(uploadUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: new Uint8Array(ciphertext),
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "(unreadable)");
+    throw new Error(`CDN upload ${response.status} ${response.statusText}: ${body.slice(0, 500)}`);
+  }
+  const downloadEncryptedQueryParam = response.headers.get("x-encrypted-param")?.trim();
+  if (!downloadEncryptedQueryParam) {
+    throw new Error("CDN upload response missing x-encrypted-param header.");
+  }
+  return { downloadEncryptedQueryParam };
 }

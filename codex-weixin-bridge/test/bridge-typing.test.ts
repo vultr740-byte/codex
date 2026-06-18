@@ -466,6 +466,185 @@ test("bridge downloads Weixin file attachments and forwards local paths to Codex
   assert.equal(fs.readFileSync(input[1]?.path ?? "").equals(imageBytes), true);
 });
 
+test("bridge sends Codex-declared output files as native Weixin attachments", async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-bridge-"));
+  const outputFile = path.join(stateDir, "answer.zip");
+  fs.writeFileSync(outputFile, "zip bytes", "utf8");
+  const receivedWeixinRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];
+  const uploadedCdnBodies: Buffer[] = [];
+  let getUpdatesCount = 0;
+  let sawDeveloperInstructions = false;
+
+  const cdnServer = http.createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    if (req.method === "POST" && url.pathname === "/upload") {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      req.on("end", () => {
+        uploadedCdnBodies.push(Buffer.concat(chunks));
+        res.setHeader("x-encrypted-param", "uploaded-param");
+        res.end("ok");
+      });
+      return;
+    }
+    res.writeHead(404);
+    res.end("not found");
+  });
+  const cdnBaseUrl = await listen(cdnServer);
+
+  const weixinServer = http.createServer((req, res) => {
+    const endpoint = new URL(req.url ?? "/", "http://localhost").pathname.replace(/^\/+/, "");
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk.toString("utf8");
+    });
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) as Record<string, unknown> : {};
+      receivedWeixinRequests.push({ endpoint, body });
+      res.setHeader("content-type", "application/json");
+
+      if (endpoint === "ilink/bot/getupdates") {
+        getUpdatesCount += 1;
+        if (getUpdatesCount === 1) {
+          res.end(JSON.stringify({
+            ret: 0,
+            get_updates_buf: "buf-1",
+            msgs: [
+              {
+                message_id: "msg-1",
+                from_user_id: "user-1",
+                context_token: "ctx-1",
+                item_list: [{ type: 1, text_item: { text: "send me the zip" } }],
+              },
+            ],
+          }));
+          return;
+        }
+        res.end(JSON.stringify({ ret: 0, get_updates_buf: "buf-1", msgs: [] }));
+        return;
+      }
+
+      if (endpoint === "ilink/bot/getconfig") {
+        res.end(JSON.stringify({ ret: 0, typing_ticket: "ticket-1" }));
+        return;
+      }
+
+      if (endpoint === "ilink/bot/getuploadurl") {
+        res.end(JSON.stringify({
+          ret: 0,
+          upload_param: "upload-param",
+        }));
+        return;
+      }
+
+      res.end(JSON.stringify({ ret: 0 }));
+    });
+  });
+
+  const weixinBaseUrl = await listen(weixinServer);
+  const appServer = new WebSocketServer({ port: 0 });
+  await new Promise<void>((resolve) => {
+    appServer.once("listening", resolve);
+  });
+  appServer.on("connection", (ws) => {
+    ws.on("message", (data) => {
+      const message = JSON.parse(data.toString()) as {
+        id?: number;
+        method?: string;
+        params?: { developerInstructions?: string };
+      };
+
+      if (message.id !== undefined && message.method === "initialize") {
+        ws.send(JSON.stringify({ id: message.id, result: {} }));
+        return;
+      }
+      if (message.id !== undefined && message.method === "thread/start") {
+        sawDeveloperInstructions = /codex-weixin-attachments/.test(message.params?.developerInstructions ?? "");
+        ws.send(JSON.stringify({ id: message.id, result: { thread: { id: "thread-1" } } }));
+        return;
+      }
+      if (message.id !== undefined && message.method === "turn/start") {
+        ws.send(JSON.stringify({ id: message.id, result: { turn: { id: "turn-1" } } }));
+        setTimeout(() => {
+          ws.send(JSON.stringify({
+            method: "item/agentMessage/delta",
+            params: {
+              turnId: "turn-1",
+              delta: [
+                "Here is the zip.",
+                "",
+                "```codex-weixin-attachments",
+                JSON.stringify({ attachments: [{ path: outputFile, caption: "zip file" }] }),
+                "```",
+              ].join("\n"),
+            },
+          }));
+          ws.send(JSON.stringify({
+            method: "turn/completed",
+            params: { turn: { id: "turn-1", status: "completed" } },
+          }));
+        }, 50);
+      }
+    });
+  });
+
+  const appServerAddress = appServer.address();
+  assert.ok(appServerAddress && typeof appServerAddress !== "string");
+  const appServerUrl = `ws://127.0.0.1:${appServerAddress.port}`;
+  const bridge = new Bridge({
+    appServerUrl,
+    appServerToken: "codex-token",
+    weixinBaseUrl,
+    weixinCdnBaseUrl: cdnBaseUrl,
+    weixinToken: "weixin-token",
+    controlApiToken: null,
+    stateDir,
+    uploadDir: path.join(stateDir, "uploads"),
+    codexThreadMode: "per_user",
+    defaultCwd: null,
+  });
+
+  const bridgeTask = bridge.start();
+
+  try {
+    await waitFor(() =>
+      receivedWeixinRequests.filter((request) => request.endpoint === "ilink/bot/sendmessage").length >= 2
+    );
+  } finally {
+    await bridge.stop();
+    appServer.close();
+    weixinServer.close();
+    cdnServer.close();
+    await bridgeTask;
+  }
+
+  assert.equal(sawDeveloperInstructions, true);
+  assert.equal(uploadedCdnBodies.length, 1);
+
+  const sendMessages = receivedWeixinRequests.filter((request) => request.endpoint === "ilink/bot/sendmessage");
+  const textMessage = sendMessages[0]?.body.msg as { item_list?: Array<{ text_item?: { text?: string } }> } | undefined;
+  assert.equal(textMessage?.item_list?.[0]?.text_item?.text, "Here is the zip.");
+  assert.doesNotMatch(textMessage?.item_list?.[0]?.text_item?.text ?? "", /codex-weixin-attachments/);
+
+  const fileMessage = sendMessages[1]?.body.msg as {
+    item_list?: Array<{
+      text_item?: { text?: string };
+      file_item?: {
+        file_name?: string;
+        len?: string;
+        media?: { encrypt_query_param?: string; aes_key?: string };
+      };
+    }>;
+  } | undefined;
+  assert.equal(fileMessage?.item_list?.[0]?.text_item?.text, "zip file");
+  assert.equal(fileMessage?.item_list?.[1]?.file_item?.file_name, "answer.zip");
+  assert.equal(fileMessage?.item_list?.[1]?.file_item?.len, String(Buffer.byteLength("zip bytes")));
+  assert.equal(fileMessage?.item_list?.[1]?.file_item?.media?.encrypt_query_param, "uploaded-param");
+  assert.ok(fileMessage?.item_list?.[1]?.file_item?.media?.aes_key);
+});
+
 test("bridge sends a billing failure message when a Codex turn fails with payment error", async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-bridge-"));
   const receivedWeixinRequests: Array<{ endpoint: string; body: Record<string, unknown> }> = [];

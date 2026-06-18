@@ -17,6 +17,13 @@ export const MessageState = {
   FINISH: 2,
 } as const;
 
+export const UploadMediaType = {
+  IMAGE: 1,
+  VIDEO: 2,
+  FILE: 3,
+  VOICE: 4,
+} as const;
+
 export type CdnMedia = {
   encrypt_query_param?: string;
   aes_key?: string;
@@ -94,4 +101,10 @@ export type WeixinApiResponse = {
   ret?: number;
   errcode?: number;
   errmsg?: string;
+};
+
+export type GetUploadUrlResponse = WeixinApiResponse & {
+  upload_param?: string;
+  thumb_upload_param?: string;
+  upload_full_url?: string;
 };
