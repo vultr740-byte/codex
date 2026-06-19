@@ -29,6 +29,7 @@ inside the same container.
 - `CODEX_WEIXIN_UPLOAD_DIR` optional, defaults to `$CODEX_WEIXIN_STATE_DIR/uploads`
 - `CODEX_THREAD_MODE` optional, defaults to `per_user`
 - `CODEX_DEFAULT_CWD` optional
+- `CODEX_TURN_TIMEOUT_MS` optional, defaults to `1800000` (30 minutes)
 - `PORT` optional, defaults to `3000`
 
 ## Run

@@ -109,6 +109,7 @@ test("bridge sends and cancels Weixin typing while a Codex turn is running", asy
     uploadDir: path.join(stateDir, "uploads"),
     codexThreadMode: "per_user",
     defaultCwd: null,
+    codexTurnTimeoutMs: 180_000,
   });
 
   const bridgeTask = bridge.start();
@@ -259,6 +260,7 @@ test("bridge refreshes a stale Codex thread binding when the app-server no longe
     uploadDir: path.join(stateDir, "uploads"),
     codexThreadMode: "per_user",
     defaultCwd: null,
+    codexTurnTimeoutMs: 180_000,
   });
 
   const bridgeTask = bridge.start();
@@ -435,6 +437,7 @@ test("bridge downloads Weixin file attachments and forwards local paths to Codex
     uploadDir,
     codexThreadMode: "per_user",
     defaultCwd: null,
+    codexTurnTimeoutMs: 180_000,
   });
 
   const bridgeTask = bridge.start();
@@ -611,6 +614,7 @@ test("bridge sends Codex-declared output files as native Weixin attachments", as
     uploadDir: path.join(stateDir, "uploads"),
     codexThreadMode: "per_user",
     defaultCwd: null,
+    codexTurnTimeoutMs: 180_000,
   });
 
   const bridgeTask = bridge.start();
@@ -802,6 +806,7 @@ test("bridge normalizes Codex-declared images before Weixin CDN upload", async (
     uploadDir: path.join(stateDir, "uploads"),
     codexThreadMode: "per_user",
     defaultCwd: null,
+    codexTurnTimeoutMs: 180_000,
   });
 
   const bridgeTask = bridge.start();
@@ -967,6 +972,7 @@ test("bridge uploads original image attachments when media tools are unavailable
     uploadDir: path.join(stateDir, "uploads"),
     codexThreadMode: "per_user",
     defaultCwd: null,
+    codexTurnTimeoutMs: 180_000,
   });
 
   const bridgeTask = bridge.start();
@@ -1142,6 +1148,7 @@ test("bridge falls back from upload_full_url to upload_param when Weixin CDN rej
     uploadDir: path.join(stateDir, "uploads"),
     codexThreadMode: "per_user",
     defaultCwd: null,
+    codexTurnTimeoutMs: 180_000,
   });
 
   const bridgeTask = bridge.start();
@@ -1266,6 +1273,7 @@ test("bridge sends a billing failure message when a Codex turn fails with paymen
     uploadDir: path.join(stateDir, "uploads"),
     codexThreadMode: "per_user",
     defaultCwd: null,
+    codexTurnTimeoutMs: 180_000,
   });
 
   const bridgeTask = bridge.start();

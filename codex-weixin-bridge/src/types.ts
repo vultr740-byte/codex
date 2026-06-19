@@ -9,6 +9,7 @@ export type BridgeConfig = {
   uploadDir: string;
   codexThreadMode: "per_user" | "single_thread";
   defaultCwd: string | null;
+  codexTurnTimeoutMs: number;
 };
 
 export type WeixinInboundMessage = {

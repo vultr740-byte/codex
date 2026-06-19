@@ -33,6 +33,7 @@ export class Bridge {
       websocketUrl: config.appServerUrl,
       token: config.appServerToken,
       defaultCwd: config.defaultCwd,
+      turnTimeoutMs: config.codexTurnTimeoutMs,
     });
     this.threadBindings = new ThreadBindingStore(config.stateDir);
     this.dedup = new DedupStore(config.stateDir);

@@ -29,6 +29,7 @@ const WEIXIN_DEVELOPER_INSTRUCTIONS = [
   "```",
   "The bridge will upload those paths and send them as native Weixin attachment payloads. Keep normal user-facing text outside the fenced block.",
 ].join("\n");
+const DEFAULT_TURN_TIMEOUT_MS = 30 * 60 * 1000;
 
 export type CodexTurnResult = {
   assistantText: string;
@@ -41,6 +42,7 @@ export class CodexAppServerClient {
   private readonly token: string;
   private readonly defaultCwd: string | null;
   private readonly requestTimeoutMs: number;
+  private readonly turnTimeoutMs: number;
   private ws: WebSocket | null = null;
   private initialized = false;
   private nextId = 1;
@@ -60,11 +62,13 @@ export class CodexAppServerClient {
     token: string;
     defaultCwd?: string | null;
     requestTimeoutMs?: number;
+    turnTimeoutMs?: number;
   }) {
     this.websocketUrl = normalizeWebSocketUrl(params.websocketUrl);
     this.token = params.token;
     this.defaultCwd = params.defaultCwd ?? null;
     this.requestTimeoutMs = params.requestTimeoutMs ?? 30_000;
+    this.turnTimeoutMs = params.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS;
   }
 
   async ensureConnected(): Promise<void> {
@@ -122,7 +126,7 @@ export class CodexAppServerClient {
       const timeout = setTimeout(() => {
         this.activeTurns.delete(turnId);
         reject(new Error("Timed out waiting for Codex turn completion."));
-      }, params.timeoutMs ?? 180_000);
+      }, params.timeoutMs ?? this.turnTimeoutMs);
 
       this.activeTurns.set(turnId, {
         finalText: "",
